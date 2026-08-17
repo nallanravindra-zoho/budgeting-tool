@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Access is controlled by an explicit allowlist, NOT by email domain —
+    // deliberately independent of whether Cyberknight runs Google Workspace,
+    // Microsoft 365, or anything else. Add/remove people by adding/removing
+    // documents in approvedUsers, not by changing this file.
+    function isApprovedUser() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && exists(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower()))
+        && get(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower())).data.active != false;
+    }
+
+    // The allowlist itself. Any signed-in user can read it (needed so
+    // AuthGate.jsx can check whether *they themselves* are approved right
+    // after signing in) — but only an already-approved user can write to
+    // it, so an unapproved account can't just add itself.
+    // BOOTSTRAP NOTE: this means the very first approved user can't be
+    // added through the app — use scripts/add-approved-user.js (Admin SDK,
+    // bypasses these rules) to seed at least one before anyone can sign in.
+    match /approvedUsers/{email} {
+      allow read: if request.auth != null;
+      allow write: if isApprovedUser();
+    }
+
+    match /budgetVersions/{versionId} {
+      allow read, write: if isApprovedUser();
+      match /vendorBudgets/{vendorId} {
+        allow read, write: if isApprovedUser();
+      }
+    }
+
+    // Cached actuals from Zoho — read-only from the client. Only the
+    // syncCipr Cloud Function (Admin SDK, bypasses these rules entirely)
+    // is allowed to write here.
+    match /ciprActuals/{vendorId} {
+      allow read: if isApprovedUser();
+      allow write: if false;
+    }
+
+    match /employees/{employeeId} {
+      allow read, write: if isApprovedUser();
+    }
+
+    match /sgaExpenses/{categoryId} {
+      allow read, write: if isApprovedUser();
+    }
+
+    // Default deny — anything not explicitly matched above is inaccessible.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

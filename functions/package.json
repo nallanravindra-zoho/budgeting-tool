@@ -1,0 +1,10 @@
+{
+  "name": "functions",
+  "description": "Cyberknight Budget Desk — the two functions requiring secrets (chat, CIPR sync)",
+  "engines": { "node": "22" },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.3.1",
+    "firebase-functions": "^5.0.0"
+  }
+}
