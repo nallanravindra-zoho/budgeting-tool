@@ -34,7 +34,8 @@ firebase.json              — single deploy config (hosting + functions + rules
 firestore.rules            — access control for budget data (replaces Express middleware)
 firestore.indexes.json     — required by Firebase CLI, empty for now
 functions/
-  index.js                 — the entire server-side surface: chat + syncCipr
+  index.js                 — the server-side surface: chat, syncCipr, syncBudgets,
+                              syncOtherExpensesLedger, syncBills
   zohoAnalytics.js          — Zoho OAuth + Bulk Export client
   package.json
 frontend/
@@ -42,6 +43,8 @@ frontend/
     App.jsx                 — same UI as before, data layer now calls Firestore directly
     firestoreData.js         — direct Firestore reads/writes (replaces the old REST API client)
     chatClient.js             — calls the `chat` function via Firebase's httpsCallable
+    assumptions.js, cashFlowData.js, employeeData.js,
+    operationalStats.js, otherExpensesData.js, vendorPerformance.js — per-tab data modules
     firebase.js, AuthGate.jsx — unchanged from v2
     main.jsx
   index.html, vite.config.js, package.json
