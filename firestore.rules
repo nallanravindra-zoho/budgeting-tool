@@ -10,7 +10,37 @@ service cloud.firestore {
       return request.auth != null
         && request.auth.token.email != null
         && exists(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower()))
-        && get(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower())).data.active != false;
+        // .get('active', true) — NOT .data.active — on purpose. AuthGate.jsx's
+        // client-side check (`data().active !== false`) treats a MISSING
+        // `active` field as "not false", i.e. approved. Direct field access
+        // in rules doesn't have that JS looseness: `.data.active` on a doc
+        // that never set `active` is an evaluation error, not `undefined`,
+        // and Firestore rules fail closed on that — denying every read/write
+        // for that account everywhere, not just wherever `active` matters.
+        // .get(key, default) is the rules-language way to say "missing means
+        // true here," matching AuthGate's behavior exactly. Found 2026-08-24:
+        // a manually-created approvedUsers doc (added via the Console for an
+        // HR-restricted test login, no `active` field set) passed AuthGate
+        // fine but failed every single Firestore read behind it.
+        && get(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower())).data.get('active', true) != false;
+    }
+
+    // Customized login access (per-tab restriction). `allowedTabs` on an
+    // approvedUsers doc is optional and additive-only in meaning: if it's
+    // missing, null, or empty, the account is unrestricted — every existing
+    // approved user keeps full access without any migration. Only set
+    // `allowedTabs` (e.g. ["employees"]) on the specific accounts that
+    // should be limited, such as an HR head who should only reach HR
+    // Budgeting. This is the server-side half of the restriction — it's
+    // what actually stops a restricted account from reading/writing
+    // sensitive data directly (e.g. via browser devtools), not just from
+    // seeing the tab in the sidebar; App.jsx's Sidebar filtering is the
+    // client-side half that hides tabs from view. Call isApprovedUser()
+    // first in any rule that also calls this — canAccessTab() assumes the
+    // approvedUsers doc already exists (isApprovedUser's exists() check).
+    function canAccessTab(tabId) {
+      let myDoc = get(/databases/$(database)/documents/approvedUsers/$(request.auth.token.email.lower())).data;
+      return !("allowedTabs" in myDoc) || myDoc.allowedTabs == null || myDoc.allowedTabs.size() == 0 || tabId in myDoc.allowedTabs;
     }
 
     // The allowlist itself. Any signed-in user can read it (needed so
@@ -25,6 +55,14 @@ service cloud.firestore {
       allow write: if isApprovedUser();
     }
 
+    // Single config doc — currently just { activeBudgetingYear }. Any
+    // approved user can update it (e.g. rolling 2027 -> 2028 next cycle);
+    // not worth a separate admin role for one field. Read is needed by
+    // every page that shows the year filter or gates editing.
+    match /settings/{docId} {
+      allow read, write: if isApprovedUser();
+    }
+
     match /budgetVersions/{versionId} {
       allow read, write: if isApprovedUser();
       match /vendorBudgets/{vendorId} {
@@ -34,18 +72,171 @@ service cloud.firestore {
 
     // Cached actuals from Zoho — read-only from the client. Only the
     // syncCipr Cloud Function (Admin SDK, bypasses these rules entirely)
-    // is allowed to write here.
-    match /ciprActuals/{vendorId} {
+    // is allowed to write here. Year-keyed: ciprActuals/{year}/vendors/{vendor}
+    // (was a flat ciprActuals/{vendor} collection before the year filter
+    // was added).
+    match /ciprActuals/{year} {
       allow read: if isApprovedUser();
       allow write: if false;
+      match /vendors/{vendorId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
+      // Raw invoice-level rows — read-only, same pattern as vendors above.
+      // Only queried server-side today (the chat function's queryInvoices
+      // tool, via the Admin SDK, which bypasses these rules entirely) —
+      // this rule exists for when/if a frontend UI reads it directly.
+      match /invoices/{invoiceId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
     }
 
+    // Cached AP actuals from Zoho's Bills view (Cash Flow module) — same
+    // read-only-from-client pattern as ciprActuals. Only the syncBills
+    // Cloud Function (Admin SDK, bypasses these rules) writes here.
+    // Year-keyed by Bill Date's year, same convention as
+    // ciprActuals/{year}/invoices being keyed by Invoice Date's year.
+    match /billsActuals/{year} {
+      allow read: if isApprovedUser();
+      allow write: if false;
+      match /bills/{billId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
+    }
+
+    // Cached budgets from Zoho (month-wise/country-wise/vendor-wise views,
+    // all years) — read-only from the client, same pattern as ciprActuals.
+    // Only the syncBudgets Cloud Function writes here. This is the fallback
+    // baseline for any vendor/year without an active edit in
+    // budgetVersions/working — see firestoreData.js for how the two merge.
+    match /zohoBudgets/{year} {
+      allow read: if isApprovedUser();
+      allow write: if false;
+      match /vendorBudgets/{vendorId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
+      // Company-wide per-country budget (no vendor dimension — see
+      // functions/index.js syncBudgets header comment for why).
+      match /regionBudgets/{countryId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
+    }
+
+    // Growth-based budget projections (Versions tab's "Generate Future
+    // Budgets") — a placeholder for years with no real Zoho sync yet.
+    // Client-writable, unlike zohoBudgets above, since this data is
+    // generated locally, not synced from an external source. getVendors()/
+    // getRegions()/getRegionPerformanceData() only read from here as a
+    // fallback when zohoBudgets is empty for that year — real synced data
+    // always takes priority once it exists.
+    match /budgetProjections/{year} {
+      allow read: if isApprovedUser();
+      match /vendorBudgets/{vendorId} {
+        allow read, write: if isApprovedUser();
+      }
+      match /regionBudgets/{countryId} {
+        allow read, write: if isApprovedUser();
+      }
+    }
+
+    // Gated by canAccessTab('employees') in addition to isApprovedUser() —
+    // this is the sensitive-data example from the customized-access request
+    // (an HR-only login should not be able to read HR data even by
+    // querying Firestore directly, not just be kept off the tab in the UI).
+    // The same `&& canAccessTab('tabId')` pattern can be added to any other
+    // collection below if broader per-tab data restriction is wanted later
+    // — left off everything else for now since several tabs (e.g. Overview)
+    // read across multiple collections, and gating those individually needs
+    // a tab -> collection map worked out first so a restricted user doesn't
+    // lose legitimate access to data another allowed tab needs.
     match /employees/{employeeId} {
+      allow read, write: if isApprovedUser() && canAccessTab('employees');
+    }
+
+    // Presentation-ready list of app assumptions/data sources (Assumptions
+    // tab) — freely editable, not year-scoped.
+    match /assumptions/{assumptionId} {
       allow read, write: if isApprovedUser();
     }
 
     match /sgaExpenses/{categoryId} {
       allow read, write: if isApprovedUser();
+    }
+
+    // ---- Other Expenses Budgeting Module ----
+
+    // Synced GL ledger actuals — read-only from the client, same pattern
+    // as ciprActuals/zohoBudgets. Only syncOtherExpensesLedger writes here.
+    match /otherExpensesLedger/{year} {
+      allow read: if isApprovedUser();
+      allow write: if false;
+      match /accounts/{accountId} {
+        allow read: if isApprovedUser();
+        allow write: if false;
+      }
+    }
+
+    // GL account -> category/subcategory mapping. NOT year-scoped — a GL
+    // account's category assignment persists across years. User-editable
+    // (the mapping workspace), but also written by syncOtherExpensesLedger
+    // (Admin SDK, bypasses these rules) to auto-queue newly-seen accounts
+    // as unmapped.
+    match /glAccountMappings/{accountId} {
+      allow read, write: if isApprovedUser();
+    }
+
+    // User-managed expense taxonomy — addable/editable at any time, not
+    // tied to a specific budget year.
+    match /expenseCategories/{categoryId} {
+      allow read, write: if isApprovedUser();
+    }
+
+    // One growth% per category, versioned per budget year (so 2027's
+    // assumptions stay intact once 2028 planning starts) — editable for
+    // any year, including ahead of it becoming the active budgeting year,
+    // since these are input assumptions rather than the year's actual
+    // budget data itself.
+    match /growthAssumptions/{year} {
+      allow read, write: if isApprovedUser();
+      match /categories/{categoryId} {
+        allow read, write: if isApprovedUser();
+      }
+    }
+
+    // Rent/consultant/subscription agreements, unified into one collection
+    // with a `type` field. Not year-scoped — an agreement spans its own
+    // start/end dates independent of budget years.
+    match /expenseAgreements/{agreementId} {
+      allow read, write: if isApprovedUser();
+    }
+
+    // Generated + manually-overridden budget numbers. Always readable;
+    // writes are only meant to happen for the active budgeting year — that
+    // restriction is enforced client-side (assertEditableYear, same
+    // pattern as budgetVersions/vendorBudgets) rather than in these rules,
+    // since the active year itself is admin-configurable (settings/config)
+    // and rules can't easily reference it without an extra read per check.
+    match /otherExpensesBudget/{year} {
+      allow read, write: if isApprovedUser();
+      match /lines/{lineId} {
+        allow read, write: if isApprovedUser();
+      }
+    }
+
+    // Management Forecast overrides (Vendor Performance view) — editable
+    // for ANY year, not just the active budgeting year. This is the
+    // opposite of budgetVersions' restriction on purpose: forecasts are
+    // annotated on historical/in-progress years, which are exactly the
+    // years everything else in the app treats as read-only.
+    match /managementForecasts/{year} {
+      allow read: if isApprovedUser();
+      match /vendors/{vendorId} {
+        allow read, write: if isApprovedUser();
+      }
     }
 
     // Default deny — anything not explicitly matched above is inaccessible.

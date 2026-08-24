@@ -1,8 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw } from "lucide-react";
-import { getVendors, quickEditVendorBudget, applyVendorPlan, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn } from "./firestoreData.js";
-import { callChat, syncCiprNow } from "./chatClient.js";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList } from "lucide-react";
+import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
+import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
+import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
+import { getEmployees, addEmployee, updateEmployee, resignEmployee, reinstateEmployee, deleteEmployee, setEmployeeHikes, getBenefitThresholds, setBenefitThresholds, computeEmployeeMonthlyCost, computeBenefitEligibility, computeEmployeeDashboardStats } from "./employeeData.js";
+import { getAssumptions, addAssumption, updateAssumption, removeAssumption, DEFAULT_ASSUMPTIONS } from "./assumptions.js";
+import { getInvoicesByYearRange, computeOperationalStats } from "./operationalStats.js";
+import { getCashFlowRawData, computeCashFlow, AGED_THRESHOLD_DAYS } from "./cashFlowData.js";
+import { callChat, syncCiprNow, syncOtherExpensesLedgerNow, syncBillsNow } from "./chatClient.js";
 import { signOutUser, auth } from "./firebase.js";
 
 /* ============================= EMBEDDED SEED DATA ============================= */
@@ -37,9 +43,33 @@ const fmtCompact = (n) => {
   return `${sign}$${abs.toFixed(0)}`;
 };
 const fmtFull = (n) => `$${Math.round(n || 0).toLocaleString("en-US")}`;
+const fmtMillions = (n) => `$${((n || 0) / 1_000_000).toFixed(2)}M`;
+// toLocaleString (not toFixed) specifically so large K-unit figures get
+// thousands separators (e.g. "$15,995.3K" instead of "$15995.3K") — easy
+// to misread without them once a vendor/period crosses four digits in K.
+const fmtThousands = (n) => `$${((n || 0) / 1_000).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}K`;
+// User-controlled unit for chat table output (millions/thousands/full) —
+// distinct from fmtCompact's auto-scaling, since here the person picks the
+// unit explicitly and every number in the table should honor that choice
+// consistently, not switch units row to row based on magnitude.
+const fmtByUnit = (n, unit) => {
+  if (n === null || n === undefined || isNaN(n)) return "";
+  if (unit === "thousands") return fmtThousands(n);
+  if (unit === "full") return fmtFull(n);
+  return fmtMillions(n);
+};
 const fmtPct = (n) => `${((n || 0) * 100).toFixed(1)}%`;
 const fmtPct1 = (n) => `${((n || 0) * 100).toFixed(1)}%`;
 const fmtSignedPct = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)}%`;
+
+// Global unit toggle (item 5) — one shared state (App-level, provided here
+// via context) drives every monetary number in the app: KPI cards, every
+// table, chart axes, chat tables, diff cards, vendor history. A context
+// avoids threading `numberUnit` as a prop through ~15 components for the
+// ~50 call sites that display a number. Default "millions" matches what
+// fmtCompact would've shown for typical vendor-sized figures anyway.
+const NumberUnitContext = React.createContext({ unit: "millions", setUnit: () => {}, fmtN: fmtMillions });
+const useNumberUnit = () => React.useContext(NumberUnitContext);
 
 /* ============================= MATRIX MATH ============================= */
 // A "cellsPct" object maps "month|country" -> fraction of annual revenue (sums to 1).
@@ -268,16 +298,111 @@ export default function App() {
   const [scenario, setScenario] = useState("Macnica");
   const [skoUplift, setSkoUplift] = useState(0.15);
   const [tab, setTab] = useState("overview");
+  // Per-tab access control ("customized login access") — null means
+  // unrestricted (every current login) until getMyAccessProfile() resolves
+  // and, for a restricted account, returns the specific tab ids they're
+  // allowed. See firestoreData.js getMyAccessProfile for the read and
+  // firestore.rules canAccessTab() for the server-side enforcement.
+  // `accessProfileReady` gates rendering the sidebar/tab content at all —
+  // without it, a restricted login would render every tab for one frame
+  // (allowedTabs still null while the read is in flight) and then collapse
+  // down to just its allowed tab(s), which reads as a bug, not a permission
+  // check happening. Nothing tab-related renders until this is true.
+  const [allowedTabs, setAllowedTabs] = useState(null);
+  const [accessProfileReady, setAccessProfileReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getMyAccessProfile()
+      .then(({ allowedTabs }) => { if (!cancelled) setAllowedTabs(allowedTabs); })
+      .finally(() => { if (!cancelled) setAccessProfileReady(true); });
+    return () => { cancelled = true; };
+  }, []);
+  // Belt-and-suspenders: also derived at render time (effectiveTab below) so
+  // there's no single-frame mismatch between the Sidebar's filtered items
+  // and which tab's content actually renders; this effect commits that
+  // correction into real `tab` state so it sticks for subsequent clicks.
+  useEffect(() => {
+    if (allowedTabs && !allowedTabs.includes(tab)) setTab(allowedTabs[0] || "overview");
+  }, [allowedTabs]);
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState("budget_revenue");
   const [sortDir, setSortDir] = useState("desc");
   const [editingVendor, setEditingVendor] = useState(null);
   const [editValue, setEditValue] = useState("");
   const [chatOpen, setChatOpen] = useState(true);
+  // Chat panel resize: drag the left edge to set a custom width; minimize
+  // collapses to a slim strip; maximize jumps to a large preset width.
+  // Minimize/maximize don't erase the dragged width — restoring from
+  // either goes back to whatever width was set before.
+  const [chatWidth, setChatWidth] = useState(340);
+  const [chatMinimized, setChatMinimized] = useState(false);
+  const [chatMaximized, setChatMaximized] = useState(false);
+  const CHAT_MIN_WIDTH = 280, CHAT_MAX_WIDTH = 760, CHAT_MAXIMIZED_WIDTH = 640, CHAT_MINIMIZED_WIDTH = 48;
+  const chatDraggingRef = useRef(false);
+  const effectiveChatWidth = chatMinimized ? CHAT_MINIMIZED_WIDTH : (chatMaximized ? CHAT_MAXIMIZED_WIDTH : chatWidth);
+
+  useEffect(() => {
+    const onMouseMove = (e) => {
+      if (!chatDraggingRef.current) return;
+      // Panel sits on the right edge, so width = distance from the mouse to the viewport's right edge.
+      const newWidth = window.innerWidth - e.clientX;
+      setChatWidth(Math.min(CHAT_MAX_WIDTH, Math.max(CHAT_MIN_WIDTH, newWidth)));
+      if (chatMaximized) setChatMaximized(false); // manual drag takes over from the maximize preset
+    };
+    const onMouseUp = () => {
+      if (!chatDraggingRef.current) return;
+      chatDraggingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => { window.removeEventListener("mousemove", onMouseMove); window.removeEventListener("mouseup", onMouseUp); };
+  }, [chatMaximized]);
+
+  const startChatResize = () => {
+    if (chatMinimized) return; // nothing to drag when collapsed
+    chatDraggingRef.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  // Sidebar resize/minimize/maximize — same pattern as the chat panel.
+  const [sidebarWidth, setSidebarWidth] = useState(210);
+  const [sidebarMinimized, setSidebarMinimized] = useState(false);
+  const [sidebarMaximized, setSidebarMaximized] = useState(false);
+  const SIDEBAR_MIN_WIDTH = 150, SIDEBAR_MAX_WIDTH = 420, SIDEBAR_MAXIMIZED_WIDTH = 380, SIDEBAR_MINIMIZED_WIDTH = 48;
+  const sidebarDraggingRef = useRef(false);
+  const effectiveSidebarWidth = sidebarMinimized ? SIDEBAR_MINIMIZED_WIDTH : (sidebarMaximized ? SIDEBAR_MAXIMIZED_WIDTH : sidebarWidth);
+  useEffect(() => {
+    const onMouseMove = (e) => {
+      if (!sidebarDraggingRef.current) return;
+      // Sidebar sits on the left edge, so width = distance from the viewport's left edge to the mouse.
+      setSidebarWidth(Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, e.clientX)));
+      if (sidebarMaximized) setSidebarMaximized(false); // manual drag takes over from the maximize preset
+    };
+    const onMouseUp = () => {
+      if (!sidebarDraggingRef.current) return;
+      sidebarDraggingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => { window.removeEventListener("mousemove", onMouseMove); window.removeEventListener("mouseup", onMouseUp); };
+  }, [sidebarMaximized]);
+  const startSidebarResize = () => {
+    if (sidebarMinimized) return; // nothing to drag when collapsed
+    sidebarDraggingRef.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
   const [chatMessages, setChatMessages] = useState([
-    { role: "assistant", type: "text", text: "I'm the budget assistant. Try: \"set Crowdstrike budget to 40M\" or \"increase Netskope by 10%\" or \"what's our GP% for KSA?\" — or click \"Plan FY\" on any vendor to build a full month × country split from historical linearity." }
+    { role: "assistant", type: "text", text: "Ask me anything? What can I help you with?" }
   ]);
   const [chatInput, setChatInput] = useState("");
+  const [numberUnit, setNumberUnit] = useState("millions"); // "millions" | "thousands" | "full" — user-controlled, applies to chat table output
   const [chatLoading, setChatLoading] = useState(false);
   const [pendingDiff, setPendingDiff] = useState(null);
   const [versions, setVersions] = useState([]);
@@ -288,7 +413,18 @@ export default function App() {
   const [planningVendor, setPlanningVendor] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const chatEndRef = useRef(null);
+
+  // ---- Year filter (revenue/GP pages only — see firestoreData.js for the
+  // read/write model). `year` defaults to the active budgeting year until
+  // the real value loads from Firestore; `isEditableYear` gates every edit
+  // control (inline edit, Plan FY, chat edits) — only true when the
+  // selected year IS the active budgeting year.
+  const [year, setYear] = useState(new Date().getFullYear() + 1);
+  const [activeBudgetingYear, setActiveBudgetingYearState] = useState(null);
+  const [availableYears, setAvailableYears] = useState([]);
+  const isEditableYear = activeBudgetingYear !== null && year === activeBudgetingYear;
 
   const companyMatrices = useMemo(() => buildCompanyMatrices(), []);
 
@@ -296,12 +432,45 @@ export default function App() {
   // firestore.rules, not a REST API). Falls back to bundled seed data (and
   // shows a visible error) if Firestore is unreachable or rules reject the
   // read, so a problem doesn't just silently blank the screen.
+  const [zohoRegionData, setZohoRegionData] = useState(null); // null = use client-side grid derivation (editable year); array = real Zoho region data (other years)
+
+  const loadVendorsForYear = async (y) => {
+    try {
+      const vendorRows = await getVendors(y);
+      if (Array.isArray(vendorRows) && vendorRows.length) setVendors(vendorRows);
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(`Couldn't reach Firestore (${e.message}). Showing bundled reference data instead of live data.`);
+    }
+    // Region data: real Zoho-synced totals for non-editable years (no
+    // per-vendor country cross exists in that source data — see
+    // firestoreData.js getRegions() for why); null for the editable year,
+    // which falls back to the client-side vendor-grid derivation below.
+    try {
+      const currentActiveYear = activeBudgetingYear ?? (await getActiveBudgetingYear());
+      if (y === currentActiveYear) {
+        setZohoRegionData(null);
+      } else {
+        const regions = await getRegions(y);
+        setZohoRegionData(regions);
+      }
+    } catch (e) {
+      console.error(`getRegions(${y}) failed — falling back to client-side estimate:`, e);
+      showToast(`Region actuals failed to load for ${y}: ${e.message} (showing an estimate instead — check console for details)`);
+      setZohoRegionData(null); // fall back to client-side approximation rather than showing nothing
+    }
+  };
+
   useEffect(() => {
     (async () => {
       try {
-        const [vendorRows, versionRows] = await Promise.all([getVendors(), listSavedVersions()]);
-        if (Array.isArray(vendorRows) && vendorRows.length) setVendors(vendorRows);
-        // vendorRows === [] is expected until scripts/seed-baseline-budget.js has run — not an error.
+        const [activeYear, years, versionRows] = await Promise.all([
+          getActiveBudgetingYear(), getAvailableYears(), listSavedVersions(),
+        ]);
+        setActiveBudgetingYearState(activeYear);
+        setAvailableYears(years);
+        setYear(activeYear); // default view = the year currently being budgeted
+        await loadVendorsForYear(activeYear);
         setVersions(versionRows || []);
       } catch (e) {
         setLoadError(`Couldn't reach Firestore (${e.message}). Showing bundled reference data instead of live data.`);
@@ -310,6 +479,12 @@ export default function App() {
       }
     })();
   }, []);
+
+  // Re-fetch vendors whenever the year filter changes (after initial load).
+  const handleYearChange = async (newYear) => {
+    setYear(newYear);
+    await loadVendorsForYear(newYear);
+  };
 
   // NOTE: no more autosave-the-whole-state-blob effect here. Every mutation
   // (quick edit, vendor plan, chat-confirmed edit) now writes straight to
@@ -327,7 +502,21 @@ export default function App() {
       budget_revenue: v.budget_revenue * (1 + skoUplift),
       budget_gp: v.budget_gp * (1 + skoUplift),
       monthly_budget_revenue: v.monthly_budget_revenue.map(m => m * (1 + skoUplift)),
+      // Fallback for rows without the field yet (e.g. SEED_VENDORS, the
+      // bundled fallback dataset used before Firestore data has loaded, or
+      // any other legacy source) — derive from revenue instead of crashing.
+      monthly_budget_gp: (v.monthly_budget_gp || v.monthly_budget_revenue.map(m => m * (v.gp_pct || 0))).map(m => m * (1 + skoUplift)),
       ytd_budget_revenue: v.ytd_budget_revenue * (1 + skoUplift),
+      // Real SKO actuals (from CIPR's "Included in SKO?" flag and
+      // GROSS PROFIT-SKO field — see getVendors()/syncCipr) — this was
+      // previously left untouched, silently showing Macnica's actuals
+      // even in SKO mode. Budget-side uplift above stays an approximation
+      // (SKO budget isn't separately synced from Zoho), but actuals now
+      // reflect the real, different SKO figures rather than Macnica's.
+      actual_revenue_ytd: v.actual_revenue_ytd_sko ?? v.actual_revenue_ytd,
+      actual_gp_ytd: v.actual_gp_ytd_sko ?? v.actual_gp_ytd,
+      monthly_actual_revenue: v.monthly_actual_revenue_sko || v.monthly_actual_revenue,
+      monthly_actual_gp: v.monthly_actual_gp_sko || v.monthly_actual_gp,
     }));
   }, [vendors, scenario, skoUplift]);
 
@@ -344,11 +533,30 @@ export default function App() {
     return { totalBudgetRev, totalBudgetGp, totalYtdBudget, totalActualYtd, totalActualGpYtd, varAmt, varPct, blendedGpPct, actualGpPct };
   }, [scenarioVendors, scenario, skoUplift]);
 
-  const monthlyData = useMemo(() => MONTHS.map((m, i) => {
-    const budget = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_revenue[i] || 0), 0);
-    const actual = i <= CURRENT_MONTH_IDX ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_revenue[i] || 0), 0) : null;
-    return { month: m, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null };
-  }), [scenarioVendors]);
+  const monthlyData = useMemo(() => {
+    const cutoffIdx = getActualCutoffMonthIndex(year);
+    return MONTHS.map((m, i) => {
+      const budget = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_revenue?.[i] || 0), 0);
+      const actual = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_revenue?.[i] || 0), 0) : null;
+      return { month: m, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null };
+    });
+  }, [scenarioVendors, year]);
+
+  const monthlyGpData = useMemo(() => {
+    const cutoffIdx = getActualCutoffMonthIndex(year);
+    return MONTHS.map((m, i) => {
+      const budgetGp = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_gp?.[i] || 0), 0);
+      const budgetRev = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_revenue?.[i] || 0), 0);
+      const actualGp = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_gp?.[i] || 0), 0) : null;
+      const actualRev = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_revenue?.[i] || 0), 0) : null;
+      return {
+        month: m, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null,
+        // Blended GP% (sum GP / sum revenue), not an average of each vendor's own %.
+        "Budget GP%": budgetRev ? +(budgetGp / budgetRev * 100).toFixed(1) : 0,
+        "Actual GP%": (actualRev !== null && actualRev) ? +(actualGp / actualRev * 100).toFixed(1) : null,
+      };
+    });
+  }, [scenarioVendors, year]);
 
   const movers = useMemo(() => [...scenarioVendors]
     .map(v => ({ ...v, varAmt: v.actual_revenue_ytd - v.ytd_budget_revenue }))
@@ -373,11 +581,15 @@ export default function App() {
   const startEdit = (v) => { setEditingVendor(v.vendor); setEditValue(String(Math.round(v.budget_revenue))); };
   const commitEdit = (vendorName) => {
     const num = parseFloat(editValue.replace(/[^0-9.]/g, ""));
-    if (!isNaN(num) && num >= 0) applyBudgetChange(vendorName, num, `Manually edited to ${fmtCompact(num)}`);
+    if (!isNaN(num) && num >= 0) applyBudgetChange(vendorName, num, `Manually edited to ${fmtByUnit(num, numberUnit)}`);
     setEditingVendor(null);
   };
 
   const applyBudgetChange = (vendorName, newRevenue, note) => {
+    if (!isEditableYear) {
+      showToast(`${year} is read-only — editing is only enabled for the active budgeting year (${activeBudgetingYear}).`);
+      return;
+    }
     setVendors(prev => prev.map(v => {
       if (v.vendor !== vendorName) return v;
       const ratio = v.budget_revenue ? newRevenue / v.budget_revenue : 1;
@@ -395,11 +607,15 @@ export default function App() {
     // Optimistic UI update above; persist to backend. If this fails, the UI
     // is now out of sync with the DB until next reload — worth adding a
     // retry/rollback UX later, kept simple for now.
-    quickEditVendorBudget(vendorName, newRevenue)
+    quickEditVendorBudget(vendorName, newRevenue, year)
       .catch(e => showToast(`Saved locally but backend sync failed: ${e.message}`));
   };
 
   const applyVendorPlan = (vendorName, grid, gpPct) => {
+    if (!isEditableYear) {
+      showToast(`${year} is read-only — editing is only enabled for the active budgeting year (${activeBudgetingYear}).`);
+      return;
+    }
     let totalRev = 0;
     const monthlyRev = new Array(12).fill(0);
     for (const m in grid) {
@@ -419,9 +635,31 @@ export default function App() {
         country_grid: grid,
       };
     }));
-    showToast(`${vendorName} FY plan applied: ${fmtCompact(totalRev)} @ ${fmtPct(gpPct)} GP`);
-    applyVendorPlan(vendorName, grid, gpPct)
+    showToast(`${vendorName} FY plan applied: ${fmtByUnit(totalRev, numberUnit)} @ ${fmtPct(gpPct)} GP`);
+    applyVendorPlanFn(vendorName, grid, gpPct, year)
       .catch(e => showToast(`Saved locally but backend sync failed: ${e.message}`));
+  };
+
+  const [addVendorModalOpen, setAddVendorModalOpen] = useState(false);
+  const handleAddVendor = async (vendorName, startMonth) => {
+    try {
+      await addVendorFn(vendorName, year, startMonth);
+      await loadVendorsForYear(year);
+      showToast(`${vendorName} added for ${year}${startMonth > 1 ? ` (starting ${MONTHS[startMonth - 1]})` : ""}`);
+      setAddVendorModalOpen(false);
+    } catch (e) {
+      showToast(`Couldn't add vendor: ${e.message}`);
+    }
+  };
+  const handleRemoveVendor = async (vendorName) => {
+    if (!window.confirm(`Remove ${vendorName} from the ${year} budget? This can't be undone.`)) return;
+    try {
+      await removeVendorFn(vendorName, year);
+      await loadVendorsForYear(year);
+      showToast(`${vendorName} removed from ${year}`);
+    } catch (e) {
+      showToast(`Couldn't remove vendor: ${e.message}`);
+    }
   };
 
   /* ============================= CHAT ASSISTANT ============================= */
@@ -432,8 +670,8 @@ export default function App() {
   // client only sends the user's message plus enough context for the
   // function to build the right prompt. httpsCallable (in chatClient.js)
   // attaches the auth token automatically — no manual header needed here.
-  const callClaude = async (userText, mode, context) => {
-    return callChat(userText, scenario, mode, context);
+  const callClaude = async (userText, mode, context, history) => {
+    return callChat(userText, scenario, mode, { ...context, year, isEditableYear }, history);
   };
 
   const resolveEditValue = (vendor, parsed) => {
@@ -448,14 +686,34 @@ export default function App() {
     }
   };
 
+  // Soft interrupt: httpsCallable can't truly cancel a request already in
+  // flight server-side, so "stop" means: mark this request as abandoned,
+  // immediately free up the UI, and silently discard the result whenever
+  // it does eventually arrive rather than displaying it.
+  const chatActiveRequestRef = useRef(null);
+  const stopChat = () => {
+    chatActiveRequestRef.current = null;
+    setChatLoading(false);
+  };
+
   const sendChat = async () => {
     const text = chatInput.trim();
     if (!text || chatLoading) return;
+    // Conversation memory: send everything said so far (oldest first),
+    // excluding the message about to be sent (that goes as `message`
+    // separately) — see functions/index.js's chat function for how this
+    // gets converted into Gemini's `contents` format. Table/diff messages
+    // carry their own `text` summary specifically so they contribute
+    // correctly here, not just in the UI.
+    const historyForBackend = chatMessages.filter(m => m.text).map(m => ({ role: m.role, text: m.text }));
     setChatMessages(m => [...m, { role: "user", type: "text", text }]);
     setChatInput("");
     setChatLoading(true);
+    const requestId = {};
+    chatActiveRequestRef.current = requestId;
     try {
-      const parsed = await callClaude(text);
+      const parsed = await callClaude(text, undefined, undefined, historyForBackend);
+      if (chatActiveRequestRef.current !== requestId) return; // stopped, or superseded by a newer send — discard
       if (parsed.type === "edit") {
         const vendor = vendors.find(v => v.vendor.toLowerCase() === parsed.vendor.toLowerCase());
         if (!vendor) {
@@ -464,22 +722,54 @@ export default function App() {
           const newVal = resolveEditValue(vendor, parsed);
           const newGp = vendor.budget_revenue ? vendor.budget_gp * (newVal / vendor.budget_revenue) : newVal * vendor.gp_pct;
           setPendingDiff({ vendor: vendor.vendor, oldRevenue: vendor.budget_revenue, newRevenue: newVal, oldGp: vendor.budget_gp, newGp, explanation: parsed.explanation });
-          setChatMessages(m => [...m, { role: "assistant", type: "diff" }]);
+          setChatMessages(m => [...m, {
+            role: "assistant", type: "diff",
+            text: `Proposed: ${vendor.vendor} budget → ${fmtByUnit(newVal, numberUnit)}${parsed.explanation ? ` — ${parsed.explanation}` : ""}`,
+          }]);
         }
+      } else if (parsed.type === "table") {
+        setChatMessages(m => [...m, {
+          role: "assistant", type: "table", text: parsed.message,
+          table: { title: parsed.title, columns: parsed.columns || [], rows: parsed.rows || [] },
+        }]);
       } else if (parsed.type === "answer" || parsed.type === "clarify") {
         setChatMessages(m => [...m, { role: "assistant", type: "text", text: parsed.message }]);
       } else {
         setChatMessages(m => [...m, { role: "assistant", type: "text", text: "I didn't quite catch that — try rephrasing, e.g. \"set Netskope to 8M\"." }]);
       }
     } catch (e) {
+      if (chatActiveRequestRef.current !== requestId) return;
       setChatMessages(m => [...m, { role: "assistant", type: "text", text: "Something went wrong reaching the assistant. Please try again." }]);
-    } finally { setChatLoading(false); }
+    } finally {
+      if (chatActiveRequestRef.current === requestId) setChatLoading(false);
+    }
+  };
+
+  // Edit-and-resubmit: populate the input with a past user message and
+  // remove it plus everything after it, so resending regenerates from
+  // that point instead of appending a duplicate.
+  const editUserMessage = (index) => {
+    const msg = chatMessages[index];
+    if (!msg || msg.role !== "user") return;
+    setChatInput(msg.text || "");
+    setChatMessages(prev => prev.slice(0, index));
+  };
+
+  // New chat: every message sent so far gets resent as history on each
+  // turn (see sendChat's historyForBackend), so a long-running
+  // conversation keeps growing the tokens sent on every subsequent
+  // message. Starting fresh resets that back to zero.
+  const newChat = () => {
+    stopChat(); // discard anything still in flight from the old conversation
+    setChatMessages([{ role: "assistant", type: "text", text: "Ask me anything? What can I help you with?" }]);
+    setChatInput("");
+    setPendingDiff(null);
   };
 
   const confirmDiff = () => {
     if (!pendingDiff) return;
-    applyBudgetChange(pendingDiff.vendor, pendingDiff.newRevenue, `${pendingDiff.vendor} budget updated to ${fmtCompact(pendingDiff.newRevenue)}`);
-    setChatMessages(m => [...m, { role: "assistant", type: "text", text: `Applied ✓ ${pendingDiff.vendor} budget is now ${fmtCompact(pendingDiff.newRevenue)}.` }]);
+    applyBudgetChange(pendingDiff.vendor, pendingDiff.newRevenue, `${pendingDiff.vendor} budget updated to ${fmtByUnit(pendingDiff.newRevenue, numberUnit)}`);
+    setChatMessages(m => [...m, { role: "assistant", type: "text", text: `Applied ✓ ${pendingDiff.vendor} budget is now ${fmtByUnit(pendingDiff.newRevenue, numberUnit)}.` }]);
     setPendingDiff(null);
   };
   const cancelDiff = () => {
@@ -502,24 +792,26 @@ export default function App() {
   const loadVersion = async (id) => {
     try {
       await loadVersionFn(id);
-      const fresh = await getVendors();
-      setVendors(fresh);
+      await loadVendorsForYear(year);
       showToast("Version loaded");
       setTab("overview");
     } catch (e) {
       showToast(`Couldn't load that version: ${e.message}`);
     }
   };
-  const resetToBaseline = () => { setVendors(SEED_VENDORS); showToast("Reset to bundled reference data (not saved to backend — this is a local-only preview)"); };
-
+  // Syncs actuals for whichever year is currently selected — for the
+  // current year this is an ongoing refresh (new invoices since last
+  // sync); for a past year it's typically a one-time backfill (past
+  // actuals don't change once synced). Same button either way — no
+  // separate "backfill" action needed.
   const syncNow = async () => {
     if (syncing) return;
     setSyncing(true);
     try {
-      const result = await syncCiprNow();
-      const fresh = await getVendors();
-      setVendors(fresh);
-      showToast(`Synced ${result.vendorsUpdated} vendors from Zoho — as of ${new Date(result.syncedAt).toLocaleTimeString()}`);
+      const result = await syncCiprNow(year);
+      await loadVendorsForYear(year);
+      setLastSyncedAt(new Date(result.syncedAt));
+      showToast(`Synced ${result.vendorsUpdated} vendors for ${result.year} from Zoho — as of ${new Date(result.syncedAt).toLocaleTimeString()}`);
     } catch (e) {
       showToast(`Sync failed: ${e.message}`);
     } finally {
@@ -527,10 +819,20 @@ export default function App() {
     }
   };
 
-  /* ---- Region aggregation: use each vendor's own grid where planned, else fall back to company split ---- */
+  /* ---- Region aggregation: real Zoho data for non-editable years; each
+     vendor's own Plan-FY grid (falling back to company historical split)
+     for the editable year, where per-vendor country data genuinely exists ---- */
   const regionRows = useMemo(() => {
+    if (zohoRegionData) return zohoRegionData; // real synced data — see loadVendorsForYear
+    // Editable year only reaches here — it genuinely has no actuals yet
+    // (it's a future budgeting year), so start every region at 0 rather
+    // than seeding from SEED_REGIONS' bundled actual figures, which were
+    // frozen 2026 numbers and would show up regardless of which year was
+    // actually selected. SEED_REGIONS' region NAMES (not its numbers) are
+    // still useful as a starting list so known regions appear even before
+    // any vendor has a country_grid — see the initial loop below.
     const totals = {};
-    for (const r of SEED_REGIONS) totals[r.region] = { budget_revenue: 0, budget_gp: 0, actual_revenue_ytd: r.actual_revenue_ytd, actual_gp_ytd: r.actual_gp_ytd };
+    for (const r of SEED_REGIONS) totals[r.region] = { budget_revenue: 0, budget_gp: 0, actual_revenue_ytd: 0, actual_gp_ytd: 0 };
     for (const v of scenarioVendors) {
       if (v.country_grid) {
         for (const m in v.country_grid) for (const c in v.country_grid[m]) {
@@ -548,12 +850,18 @@ export default function App() {
       }
     }
     return Object.entries(totals).map(([region, d]) => ({ region, ...d })).sort((a, b) => b.budget_revenue - a.budget_revenue);
-  }, [scenarioVendors, companyMatrices]);
+  }, [scenarioVendors, companyMatrices, zohoRegionData]);
 
   const plAllocation = useMemo(() => buildPLAllocation(scenarioVendors, regionRows), [scenarioVendors, regionRows]);
 
+  // What actually renders (Sidebar highlight + main content switch) — not
+  // just raw `tab` state, so there's no frame where they disagree while the
+  // redirect effect above catches up.
+  const effectiveTab = (allowedTabs && !allowedTabs.includes(tab)) ? (allowedTabs[0] || "overview") : tab;
+
   /* ============================= RENDER ============================= */
   return (
+    <NumberUnitContext.Provider value={{ unit: numberUnit, setUnit: setNumberUnit, fmtN: (n) => fmtByUnit(n, numberUnit) }}>
     <div style={styles.appRoot}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -566,47 +874,101 @@ export default function App() {
         .num { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .tab-btn { transition: all .15s ease; }
         .row-hover:hover { background: #F0F0F0 !important; }
+        .chat-msg-user:hover .chat-edit-btn { opacity: 1 !important; }
         @keyframes slideUp { from { opacity:0; transform: translateY(8px);} to {opacity:1; transform:translateY(0);} }
         @keyframes fadeIn { from {opacity:0;} to {opacity:1;} }
         @keyframes spin { from { transform: rotate(0deg);} to { transform: rotate(360deg);} }
       `}</style>
 
-      <TopBar scenario={scenario} setScenario={setScenario} skoUplift={skoUplift} onSave={() => setSaveModalOpen(true)} onReset={resetToBaseline} onSync={syncNow} syncing={syncing} />
+      <div>
+        <TopBar
+          scenario={scenario} setScenario={setScenario} skoUplift={skoUplift} onSave={() => setSaveModalOpen(true)} onSync={syncNow} syncing={syncing}
+          year={year} activeBudgetingYear={activeBudgetingYear} lastSyncedAt={lastSyncedAt}
+          availableYears={availableYears} onYearChange={handleYearChange} isEditableYear={isEditableYear}
+        />
+      </div>
 
       <div style={styles.body}>
-        <Sidebar tab={tab} setTab={setTab} versionsCount={versions.length} />
+        {/* Nothing tab-related renders until the access profile has loaded —
+            otherwise a restricted login would flash every tab for one frame
+            (allowedTabs still null while that read is in flight) before
+            collapsing to just its allowed tab(s). */}
+        {!accessProfileReady ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", padding: 60, fontSize: 13, color: "#8A8A8A" }}>Loading…</div>
+        ) : (
+          <>
+        <Sidebar
+          tab={effectiveTab} setTab={setTab} versionsCount={versions.length} allowedTabs={allowedTabs}
+          width={effectiveSidebarWidth} onStartResize={startSidebarResize}
+          minimized={sidebarMinimized} onToggleMinimize={() => setSidebarMinimized(v => !v)}
+          maximized={sidebarMaximized} onToggleMaximize={() => setSidebarMaximized(v => !v)}
+        />
 
         <main style={styles.main}>
-          {tab === "overview" && <OverviewTab kpis={kpis} monthlyData={monthlyData} movers={movers} scenario={scenario} />}
-          {tab === "vendors" && (
-            <VendorsTab
-              rows={tableVendors} search={search} setSearch={setSearch}
-              sortKey={sortKey} sortDir={sortDir} toggleSort={toggleSort}
-              editingVendor={editingVendor} editValue={editValue} setEditValue={setEditValue}
-              startEdit={startEdit} commitEdit={commitEdit} setEditingVendor={setEditingVendor}
-              onPlan={(v) => setPlanningVendor(v)}
+          {effectiveTab === "overview" && (
+            <OverviewTab
+              kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
             />
           )}
-          {tab === "regions" && <RegionsTab regions={regionRows} />}
-          {tab === "pl" && <PLTab alloc={plAllocation} />}
-          {tab === "versions" && <VersionsTab versions={versions} onLoad={loadVersion} onSaveClick={() => setSaveModalOpen(true)} />}
+          {effectiveTab === "vendors" && (
+            isEditableYear ? (
+              <VendorsTab
+                rows={tableVendors} search={search} setSearch={setSearch}
+                sortKey={sortKey} sortDir={sortDir} toggleSort={toggleSort}
+                editingVendor={editingVendor} editValue={editValue} setEditValue={setEditValue}
+                startEdit={startEdit} commitEdit={commitEdit} setEditingVendor={setEditingVendor}
+                onPlan={(v) => setPlanningVendor(v)}
+                isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear}
+                onAddVendorClick={() => setAddVendorModalOpen(true)} onRemoveVendor={handleRemoveVendor}
+              />
+            ) : (
+              <VendorPerformanceView vendors={scenarioVendors} year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} />
+            )
+          )}
+          {effectiveTab === "regions" && (
+            isEditableYear
+              ? <RegionsTab regions={regionRows} />
+              : <RegionPerformanceView year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} scenario={scenario} />
+          )}
+          {effectiveTab === "pl" && <PLTab alloc={plAllocation} />}
+          {effectiveTab === "otherExpenses" && <OtherExpensesTab showToast={showToast} year={year} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />}
+          {effectiveTab === "cashFlow" && <CashFlowTab showToast={showToast} year={year} />}
+          {effectiveTab === "employees" && <EmployeesTab showToast={showToast} year={year} />}
+          {effectiveTab === "assumptions" && <AssumptionsTab showToast={showToast} skoUplift={skoUplift} />}
+          {effectiveTab === "operationalStats" && <OperationalStatsTab showToast={showToast} year={year} />}
+          {effectiveTab === "versions" && <VersionsTab versions={versions} onLoad={loadVersion} onSaveClick={() => setSaveModalOpen(true)} activeBudgetingYear={activeBudgetingYear} showToast={showToast} onRefreshCurrentYear={() => loadVendorsForYear(year)} />}
         </main>
+          </>
+        )}
 
-        {chatOpen && (
+        {/* Chat assistant is hidden entirely for a restricted (customized-access)
+            login, not just closed by default. Sir Slice-a-Lot's backend calls
+            the chat Cloud Function with the Admin SDK, which bypasses
+            firestore.rules (including canAccessTab) — so a restricted account
+            could otherwise ask it about data behind a tab it can't see. Full
+            fix would be teaching the chat function about allowedTabs too;
+            hiding the panel closes the obvious path in the meantime. */}
+        {accessProfileReady && !allowedTabs && chatOpen && (
           <ChatPanel
             messages={chatMessages} input={chatInput} setInput={setChatInput}
-            onSend={sendChat} loading={chatLoading}
+            onSend={sendChat} onStop={stopChat} loading={chatLoading}
             pendingDiff={pendingDiff} onConfirm={confirmDiff} onCancel={cancelDiff}
             chatEndRef={chatEndRef} onClose={() => setChatOpen(false)}
+            width={effectiveChatWidth} onStartResize={startChatResize}
+            minimized={chatMinimized} onToggleMinimize={() => setChatMinimized(v => !v)}
+            maximized={chatMaximized} onToggleMaximize={() => setChatMaximized(v => !v)}
+            onEditMessage={editUserMessage} onNewChat={newChat}
           />
         )}
       </div>
 
-      {!chatOpen && (
+      {accessProfileReady && !allowedTabs && !chatOpen && (
         <button onClick={() => setChatOpen(true)} style={styles.chatFab} aria-label="Open budget assistant"><Terminal size={20} /></button>
       )}
 
       {saveModalOpen && <SaveModal versionName={versionName} setVersionName={setVersionName} onCancel={() => setSaveModalOpen(false)} onSave={saveVersion} />}
+
+      {addVendorModalOpen && <AddVendorModal onCancel={() => setAddVendorModalOpen(false)} onAdd={handleAddVendor} year={year} />}
 
       {planningVendor && (
         <VendorPlannerModal
@@ -614,12 +976,14 @@ export default function App() {
           onClose={() => setPlanningVendor(null)}
           onApply={(grid, gpPct) => { applyVendorPlan(planningVendor.vendor, grid, gpPct); setPlanningVendor(null); }}
           callClaude={callClaude}
+          year={year}
         />
       )}
 
       {loadError && <div style={styles.loadErrorBanner}>{loadError}</div>}
       {toast && <div style={styles.toast}>{toast}</div>}
     </div>
+    </NumberUnitContext.Provider>
   );
 }
 
@@ -631,25 +995,41 @@ function scaleGrid(grid, ratio) {
 
 /* ============================= TOP-LEVEL SUBCOMPONENTS ============================= */
 
-function TopBar({ scenario, setScenario, skoUplift, onSave, onReset, onSync, syncing }) {
+function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, year, activeBudgetingYear, lastSyncedAt, availableYears, onYearChange, isEditableYear }) {
+  const { unit, setUnit } = useNumberUnit();
+  const today = new Date();
+  const todayLabel = today.toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
   return (
-    <header style={styles.topBar}>
+    <header style={{ ...styles.topBar, flexWrap: "wrap", rowGap: 6 }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
         <div style={styles.logoMark}>CK</div>
         <div>
           <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
-          <div style={styles.brandSub}>FY2026 Revenue &amp; GP Planning</div>
+          <div style={styles.brandSub}>Revenue, GP &amp; Performance Intelligence</div>
+          <div style={styles.brandSub}>{todayLabel}</div>
         </div>
       </div>
+
+      <YearSelector year={year} availableYears={availableYears} onYearChange={onYearChange} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />
+
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={styles.scenarioToggle}>
-          <button onClick={() => setScenario("Macnica")} style={{ ...styles.scenarioBtn, ...(scenario === "Macnica" ? styles.scenarioBtnActive : {}) }}>Macnica</button>
-          <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
+        <div style={styles.unitToggle} title="Number display unit — applies everywhere">
+          {[["millions", "M"], ["thousands", "K"], ["full", "Full"]].map(([val, label]) => (
+            <button key={val} onClick={() => setUnit(val)} style={{ ...styles.unitToggleBtn, ...(unit === val ? styles.unitToggleBtnActive : {}) }} title={`Show all figures in ${val}`}>{label}</button>
+          ))}
         </div>
-        <button onClick={onSync} disabled={syncing} style={styles.iconBtnGhost} title="Pull latest actuals from Zoho Analytics — manual only, no automatic schedule">
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+          <div style={styles.scenarioToggle}>
+            <button onClick={() => setScenario("Macnica")} style={{ ...styles.scenarioBtn, ...(scenario === "Macnica" ? styles.scenarioBtnActive : {}) }}>Macnica</button>
+            <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
+          </div>
+          <div style={{ fontSize: 9.5, color: "#8A8A8A", whiteSpace: "nowrap" }}>
+            {lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : "Not synced this session"}
+          </div>
+        </div>
+        <button onClick={onSync} disabled={syncing} style={styles.iconBtnGhost} title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}>
           <RefreshCw size={15} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
         </button>
-        <button onClick={onReset} style={styles.iconBtnGhost} title="Reset to baseline"><RotateCcw size={15} /></button>
         <button onClick={onSave} style={styles.primaryBtn}><Save size={15} style={{ marginRight: 6 }} /> Save Version</button>
         {auth.currentUser && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
@@ -662,22 +1042,73 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onReset, onSync, syn
   );
 }
 
-function Sidebar({ tab, setTab, versionsCount }) {
-  const items = [
-    { id: "overview", label: "Overview" },
-    { id: "vendors", label: "Vendors" },
-    { id: "regions", label: "Regions" },
-    { id: "pl", label: "P&L / EBID" },
-    { id: "versions", label: `Versions${versionsCount ? ` (${versionsCount})` : ""}` },
+function Sidebar({ tab, setTab, versionsCount, allowedTabs, width, onStartResize, minimized, onToggleMinimize, maximized, onToggleMaximize }) {
+  // Order + icons chosen with the user (2026-08-24): grouped roughly
+  // planning -> actuals/cost -> reference, icons are real lucide-react
+  // components so there's no separate icon set to maintain. "Employees"
+  // relabeled "HR Budgeting" per the same request — id stays "employees"
+  // so it doesn't touch any state/routing logic elsewhere.
+  const allItems = [
+    { id: "overview", label: "Overview", Icon: LayoutDashboard },
+    { id: "vendors", label: "Vendors", Icon: Building2 },
+    { id: "regions", label: "Regions", Icon: Globe },
+    { id: "otherExpenses", label: "Other Expenses", Icon: Receipt },
+    { id: "employees", label: "HR Budgeting", Icon: Users },
+    { id: "cashFlow", label: "Cash Flow", Icon: Wallet },
+    { id: "pl", label: "P&L / EBID", Icon: PieChartIcon },
+    { id: "operationalStats", label: "Operational Stats", Icon: BarChart3 },
+    { id: "assumptions", label: "Assumptions", Icon: ClipboardList },
+    { id: "versions", label: `Versions${versionsCount ? ` (${versionsCount})` : ""}`, Icon: History },
   ];
+  // Customized login access: allowedTabs === null means unrestricted (every
+  // login today, unless someone explicitly sets it on that person's
+  // approvedUsers doc) — see getMyAccessProfile in firestoreData.js.
+  const items = allowedTabs ? allItems.filter(it => allowedTabs.includes(it.id)) : allItems;
   return (
-    <nav style={styles.sidebar}>
-      {items.map(it => (
-        <button key={it.id} className="tab-btn" onClick={() => setTab(it.id)} style={{ ...styles.navItem, ...(tab === it.id ? styles.navItemActive : {}) }}>{it.label}</button>
-      ))}
-      <div style={styles.sidebarFootnote}>
-        Data: CIPR actuals (Jan–Aug 2026) vs Macnica FY2026 budget. Click "Plan FY" on any vendor to derive its month × country split from real historical linearity.
+    <nav style={{ ...styles.sidebar, width, flexShrink: 0, position: "relative", height: "100%", overflowY: "auto" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: minimized ? "center" : "flex-end", gap: 4, marginBottom: 8 }}>
+        {!minimized && (
+          <button onClick={onToggleMaximize} style={styles.iconBtnGhost} title={maximized ? "Restore size" : "Maximize"}>
+            {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+          </button>
+        )}
+        <button onClick={onToggleMinimize} style={styles.iconBtnGhost} title={minimized ? "Restore" : "Minimize"}>
+          {minimized ? <ChevronRight size={14} /> : <Minus size={14} />}
+        </button>
       </div>
+
+      {minimized ? (
+        // Collapsed strip — just the icon, no label; click to get the full
+        // list back. Active state matches the expanded list's blush-red
+        // treatment rather than the old plain black/white invert.
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+          {items.map(it => (
+            <button key={it.id} onClick={() => setTab(it.id)} title={it.label} style={{ ...styles.iconBtnGhost, ...(tab === it.id ? { background: "#F8E3E1", color: "#B4231E", borderColor: "#F3D2CE" } : {}) }}>
+              <it.Icon size={15} />
+            </button>
+          ))}
+        </div>
+      ) : (
+        <>
+          {items.map(it => {
+            const active = tab === it.id;
+            return (
+              <button key={it.id} className="tab-btn" onClick={() => setTab(it.id)} style={{ ...styles.navItem, ...(active ? styles.navItemActive : {}) }}>
+                <it.Icon size={16} style={{ flexShrink: 0, color: active ? "#B4231E" : "#8A8A8A" }} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.label}</span>
+              </button>
+            );
+          })}
+          <div style={styles.sidebarFootnote}>
+            Data sources — CIPR and budget files from Zoho Analytics.
+          </div>
+        </>
+      )}
+
+      {/* Drag handle on the right edge to resize — same pattern as the chat panel's left-edge handle. */}
+      {!minimized && (
+        <div onMouseDown={onStartResize} style={{ position: "absolute", right: -3, top: 0, bottom: 0, width: 6, cursor: "col-resize", zIndex: 5 }} title="Drag to resize" />
+      )}
     </nav>
   );
 }
@@ -698,105 +1129,277 @@ function KpiCard({ label, value, sub, trend }) {
   );
 }
 
-function OverviewTab({ kpis, monthlyData, movers, scenario }) {
+function YearSelector({ year, availableYears, onYearChange, isEditableYear, activeBudgetingYear }) {
+  const yearLabel = (y) => {
+    if (y === activeBudgetingYear) return " (Current Budgeting Year)";
+    if (y > activeBudgetingYear) return " (Future Budgeting Year)";
+    return "";
+  };
   return (
-    <div style={{ animation: "fadeIn .3s ease" }}>
-      <div style={styles.kpiGrid}>
-        <KpiCard label={`Annual Budget Revenue (${scenario})`} value={fmtCompact(kpis.totalBudgetRev)} />
-        <KpiCard label="YTD Actual vs Budget" value={fmtCompact(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtCompact(kpis.totalYtdBudget)} plan`} trend={kpis.varAmt >= 0 ? "up" : "down"} />
-        <KpiCard label="Annual Budget GP" value={fmtCompact(kpis.totalBudgetGp)} sub={`${fmtPct(kpis.blendedGpPct)} blended GP%`} />
-        <KpiCard label="YTD Actual GP" value={fmtCompact(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP%`} trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} />
-      </div>
-
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Monthly Revenue — Budget vs Actual</div>
-        <ResponsiveContainer width="100%" height={280}>
-          <LineChart data={monthlyData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-            <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
-            <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtCompact(v)} width={64} />
-            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
-            <Legend />
-            <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
-            <Line type="monotone" dataKey="Actual" stroke="#C00000" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Biggest Movers vs YTD Plan</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {movers.map(v => {
-            const maxAbs = Math.max(1, ...movers.map(x => Math.abs(x.varAmt)));
-            return (
-              <div key={v.vendor} style={styles.moverRow}>
-                <div style={{ width: 140, fontWeight: 600, fontSize: 13.5 }}>{v.vendor}</div>
-                <div style={{ flex: 1, height: 6, background: "#EDEDED", borderRadius: 4, position: "relative", overflow: "hidden" }}>
-                  <div style={{ position: "absolute", top: 0, bottom: 0, left: v.varAmt >= 0 ? "50%" : `${50 - Math.min(50, Math.abs(v.varAmt) / maxAbs * 50)}%`, width: `${Math.min(50, Math.abs(v.varAmt) / maxAbs * 50)}%`, background: v.varAmt >= 0 ? "#C00000" : "#C00000", borderRadius: 4 }} />
-                </div>
-                <div className="num" style={{ width: 110, textAlign: "right", fontSize: 13, color: v.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{v.varAmt >= 0 ? "+" : ""}{fmtCompact(v.varAmt)}</div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <label style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>Year</label>
+      <select value={year} onChange={(e) => onYearChange(parseInt(e.target.value, 10))} style={styles.yearSelect}>
+        {availableYears.map(y => (
+          <option key={y} value={y}>{y}{yearLabel(y)}</option>
+        ))}
+      </select>
+      {!isEditableYear && (
+        <span style={{ fontSize: 11.5, color: "#8A6D1A", background: "#FFF8E1", border: "1px solid #E8C468", borderRadius: 6, padding: "3px 8px" }} title={`Editing is only enabled for ${activeBudgetingYear}.`}>
+          Sourced from Zoho
+        </span>
+      )}
     </div>
   );
 }
 
-function VendorsTab({ rows, search, setSearch, sortKey, sortDir, toggleSort, editingVendor, editValue, setEditValue, startEdit, commitEdit, setEditingVendor, onPlan }) {
+// Minimize collapses the panel to just its title bar. Maximize toggles
+// between the default chart height and a taller one for closer reading —
+// full-viewport/modal maximize wasn't needed since panels are already
+// full main-content width; height was the only real constraint. Each
+// panel manages its own state independently (minimizing Revenue doesn't
+// affect GP). `children` is a render-prop receiving the current height,
+// so callers can pass it straight into <ResponsiveContainer height={...}>.
+function CollapsiblePanel({ title, children, defaultHeight = 280, maximizedHeight = 520 }) {
+  const [minimized, setMinimized] = useState(false);
+  const [maximized, setMaximized] = useState(false);
+  const height = maximized ? maximizedHeight : defaultHeight;
+  return (
+    <div style={styles.panel}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: minimized ? 0 : 14 }}>
+        <div style={{ ...styles.panelTitle, marginBottom: 0 }}>{title}</div>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button onClick={() => setMinimized(v => !v)} style={styles.panelIconBtn} title={minimized ? "Restore" : "Minimize"}>
+            {minimized ? <ChevronDown size={14} /> : <Minus size={14} />}
+          </button>
+          <button onClick={() => setMaximized(v => !v)} style={{ ...styles.panelIconBtn, ...(minimized ? { opacity: 0.35, cursor: "not-allowed" } : {}) }} disabled={minimized} title={maximized ? "Restore size" : "Maximize"}>
+            {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+          </button>
+        </div>
+      </div>
+      {!minimized && children(height)}
+    </div>
+  );
+}
+
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear }) {
+  const { fmtN, unit } = useNumberUnit();
+  const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
+  const [yearlyRaw, setYearlyRaw] = useState(null);
+  const [yearlyLoading, setYearlyLoading] = useState(false);
+
+  // Yearly is a genuinely different data shape (multi-year totals, not a
+  // breakdown of the currently-selected year) — fetched lazily, only once
+  // the user actually switches to it, so the default Monthly view doesn't
+  // pay for 5 years of vendor data on every page load.
+  useEffect(() => {
+    if (viewMode !== "yearly" || yearlyRaw || yearlyLoading) return;
+    setYearlyLoading(true);
+    (async () => {
+      try {
+        const endYear = activeBudgetingYear || new Date().getFullYear() + 1;
+        const years = Array.from({ length: 5 }, (_, i) => endYear - 4 + i);
+        const results = await Promise.all(years.map(y => getVendors(y).catch(() => [])));
+        setYearlyRaw(years.map((y, i) => {
+          const rows = results[i];
+          return {
+            year: String(y),
+            budgetRevenue: rows.reduce((s, v) => s + v.budget_revenue, 0),
+            actualRevenue: rows.reduce((s, v) => s + v.actual_revenue_ytd, 0),
+            budgetGp: rows.reduce((s, v) => s + v.budget_gp, 0),
+            actualGp: rows.reduce((s, v) => s + v.actual_gp_ytd, 0),
+          };
+        }));
+      } catch (e) {
+        console.error("OverviewTab yearly fetch failed:", e);
+      } finally {
+        setYearlyLoading(false);
+      }
+    })();
+  }, [viewMode, activeBudgetingYear]);
+
+  const QUARTERS = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
+  const quarterlyData = useMemo(() => QUARTERS.map((idxs, qi) => {
+    const budget = idxs.reduce((s, i) => s + (monthlyData[i]?.Budget || 0), 0);
+    const actualVals = idxs.map(i => monthlyData[i]?.Actual);
+    const hasActual = actualVals.some(v => v !== null && v !== undefined);
+    const actual = hasActual ? actualVals.reduce((s, v) => s + (v || 0), 0) : null;
+    return { month: `Q${qi + 1}`, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null };
+  }), [monthlyData]);
+
+  // Blended quarterly GP% (sum GP / sum Revenue across the quarter's
+  // months), not an average of each month's own % — same principle as
+  // the existing monthly blended GP% calc.
+  const quarterlyGpData = useMemo(() => QUARTERS.map((idxs, qi) => {
+    const budgetGp = idxs.reduce((s, i) => s + (monthlyGpData[i]?.Budget || 0), 0);
+    const budgetRev = idxs.reduce((s, i) => s + (monthlyData[i]?.Budget || 0), 0);
+    const actualGpVals = idxs.map(i => monthlyGpData[i]?.Actual);
+    const actualRevVals = idxs.map(i => monthlyData[i]?.Actual);
+    const hasActual = actualGpVals.some(v => v !== null && v !== undefined);
+    const actualGp = hasActual ? actualGpVals.reduce((s, v) => s + (v || 0), 0) : null;
+    const actualRev = hasActual ? actualRevVals.reduce((s, v) => s + (v || 0), 0) : null;
+    return {
+      month: `Q${qi + 1}`, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null,
+      "Budget GP%": budgetRev ? +(budgetGp / budgetRev * 100).toFixed(1) : 0,
+      "Actual GP%": (actualRev !== null && actualRev) ? +(actualGp / actualRev * 100).toFixed(1) : null,
+    };
+  }), [monthlyData, monthlyGpData]);
+
+  const yearlyRevenueData = useMemo(() => (yearlyRaw || []).map(d => ({
+    month: d.year, Budget: Math.round(d.budgetRevenue), Actual: d.actualRevenue > 0 ? Math.round(d.actualRevenue) : null,
+  })), [yearlyRaw]);
+  const yearlyGpData = useMemo(() => (yearlyRaw || []).map(d => ({
+    month: d.year, Budget: Math.round(d.budgetGp), Actual: d.actualGp > 0 ? Math.round(d.actualGp) : null,
+    "Budget GP%": d.budgetRevenue ? +(d.budgetGp / d.budgetRevenue * 100).toFixed(1) : 0,
+    "Actual GP%": d.actualRevenue > 0 ? +(d.actualGp / d.actualRevenue * 100).toFixed(1) : null,
+  })), [yearlyRaw]);
+
+  const chartData = viewMode === "monthly" ? monthlyData : viewMode === "quarterly" ? quarterlyData : yearlyRevenueData;
+  const gpChartData = viewMode === "monthly" ? monthlyGpData : viewMode === "quarterly" ? quarterlyGpData : yearlyGpData;
+  const periodLabel = { monthly: "Monthly", quarterly: "Quarterly", yearly: "By Year (last 5 years)" }[viewMode];
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={styles.kpiGrid}>
+        <KpiCard label={`Annual Budget Revenue (${scenario})`} value={fmtN(kpis.totalBudgetRev)} />
+        <KpiCard label="YTD Actual vs Budget" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`} trend={kpis.varAmt >= 0 ? "up" : "down"} />
+        <KpiCard label="Annual Budget GP" value={fmtN(kpis.totalBudgetGp)} sub={`${fmtPct(kpis.blendedGpPct)} blended GP%`} />
+        <KpiCard label="YTD Actual GP" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP%`} trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+        <div style={styles.plViewToggle}>
+          {[["monthly", "Monthly"], ["quarterly", "Quarterly"], ["yearly", "Yearly"]].map(([k, label]) => (
+            <button key={k} onClick={() => setViewMode(k)} style={{ ...styles.plToggleBtn, ...(viewMode === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      <CollapsiblePanel title={`${periodLabel} Revenue — Budget vs Actual`}>
+        {(height) => (viewMode === "yearly" && yearlyLoading) ? (
+          <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={height}>
+            <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
+              <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+              <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
+              <Legend />
+              <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+              <Line type="monotone" dataKey="Actual" stroke="#C00000" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </CollapsiblePanel>
+
+      <CollapsiblePanel title={`${periodLabel} Gross Profit — Budget vs Actual (with GP%)`}>
+        {(height) => (viewMode === "yearly" && yearlyLoading) ? (
+          <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={height}>
+            <LineChart data={gpChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
+              <YAxis yAxisId="left" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+              <YAxis yAxisId="right" orientation="right" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => `${v}%`} width={44} domain={[0, "dataMax"]} />
+              <Tooltip formatter={(v, name) => name.includes("GP%") ? `${v}%` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
+              <Legend />
+              <Line yAxisId="left" type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+              <Line yAxisId="left" type="monotone" dataKey="Actual" stroke="#1B8A3A" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
+              <Line yAxisId="right" type="monotone" dataKey="Budget GP%" stroke="#8A6D1A" strokeWidth={1.5} strokeDasharray="2 3" dot={false} />
+              <Line yAxisId="right" type="monotone" dataKey="Actual GP%" stroke="#C00000" strokeWidth={1.5} dot={{ r: 2.5 }} connectNulls={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </CollapsiblePanel>
+    </div>
+  );
+}
+
+function VendorsTab({ rows, search, setSearch, sortKey, sortDir, toggleSort, editingVendor, editValue, setEditValue, startEdit, commitEdit, setEditingVendor, onPlan, isEditableYear, activeBudgetingYear, onAddVendorClick, onRemoveVendor }) {
+  const { fmtN } = useNumberUnit();
   const Th = ({ k, label, align }) => (
     <th onClick={() => toggleSort(k)} style={{ ...styles.th, textAlign: align || "right", cursor: "pointer" }}>
       {label} {sortKey === k && <ChevronDown size={12} style={{ transform: sortDir === "asc" ? "rotate(180deg)" : "none", verticalAlign: -1 }} />}
     </th>
   );
+  const totals = useMemo(() => {
+    const t = { budget_revenue: 0, budget_gp: 0 };
+    for (const v of rows) { t.budget_revenue += v.budget_revenue; t.budget_gp += v.budget_gp; }
+    return { ...t, budget_gp_pct: t.budget_revenue ? t.budget_gp / t.budget_revenue : 0 };
+  }, [rows]);
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={styles.tableToolbar}>
         <div style={styles.searchBox}><Search size={14} color="#6B6B6B" /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search vendors…" style={styles.searchInput} /></div>
-        <div style={styles.tableHint}>Click a figure to edit inline · "Plan FY" builds a full month × country split</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={styles.tableHint}>
+            {isEditableYear
+              ? 'Click a figure to edit inline · "Plan FY" builds a full month × country split'
+              : `Read-only — editing is only enabled for ${activeBudgetingYear}`}
+          </div>
+          {isEditableYear && (
+            <button onClick={onAddVendorClick} style={styles.planBtn}>+ Add Vendor</button>
+          )}
+        </div>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>
+        This is the active budgeting year — there's no actuals or variance to show yet. Once {activeBudgetingYear} is underway, switch to it from the Year dropdown to see performance tracking against this budget.
       </div>
       <div style={styles.panel}>
-        <div style={{ overflowX: "auto" }}>
+        <div style={styles.tableScroll}>
           <table style={styles.table}>
             <thead>
               <tr>
-                <Th k="vendor" label="Vendor" align="left" />
-                <Th k="budget_revenue" label="Budget Rev" />
-                <Th k="actual_revenue_ytd" label="Actual Rev (YTD)" />
-                <Th k="var" label="Variance" />
+                <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>Vendor</th>
+                <Th k="budget_revenue" label="Budget Revenue" />
                 <Th k="budget_gp" label="Budget GP" />
                 <Th k="gp_pct" label="GP%" />
                 <th style={styles.th}></th>
               </tr>
             </thead>
             <tbody>
-              {rows.map(v => {
-                const varAmt = v.actual_revenue_ytd - v.ytd_budget_revenue;
-                const varPct = v.ytd_budget_revenue ? varAmt / v.ytd_budget_revenue : 0;
-                return (
-                  <tr key={v.vendor} className="row-hover" style={styles.tr}>
-                    <td style={{ ...styles.td, textAlign: "left", fontWeight: 600 }}>
-                      {v.vendor}{v.country_grid && <span title="Has a planned month × country split" style={styles.plannedDot} />}
-                    </td>
-                    <td className="num" style={styles.td}>
-                      {editingVendor === v.vendor ? (
-                        <input autoFocus className="num" value={editValue} onChange={(e) => setEditValue(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === "Enter") commitEdit(v.vendor); if (e.key === "Escape") setEditingVendor(null); }}
-                          onBlur={() => commitEdit(v.vendor)} style={styles.inlineInput} />
-                      ) : (<span onClick={() => startEdit(v)} style={styles.editableCell}>{fmtCompact(v.budget_revenue)}</span>)}
-                    </td>
-                    <td className="num" style={styles.td}>{fmtCompact(v.actual_revenue_ytd)}</td>
-                    <td className="num" style={{ ...styles.td, color: varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{varAmt >= 0 ? "+" : ""}{fmtCompact(varAmt)} <span style={{ opacity: 0.7, fontSize: 11 }}>({fmtSignedPct(varPct)})</span></td>
-                    <td className="num" style={styles.td}>{fmtCompact(v.budget_gp)}</td>
-                    <td className="num" style={styles.td}>{fmtPct(v.gp_pct)}</td>
-                    <td style={{ ...styles.td, textAlign: "center" }}>
-                      <button onClick={() => onPlan(v)} style={styles.planBtn}><Sliders size={12} style={{ marginRight: 5 }} />Plan FY</button>
-                    </td>
-                  </tr>
-                );
-              })}
+              {rows.map(v => (
+                <tr key={v.vendor} className="row-hover" style={styles.tr}>
+                  <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>
+                    {v.vendor}{v.country_grid && <span title="Has a planned month × country split" style={styles.plannedDot} />}
+                  </td>
+                  <td className="num" style={styles.td}>
+                    {isEditableYear && editingVendor === v.vendor ? (
+                      <input autoFocus className="num" value={editValue} onChange={(e) => setEditValue(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") commitEdit(v.vendor); if (e.key === "Escape") setEditingVendor(null); }}
+                        onBlur={() => commitEdit(v.vendor)} style={styles.inlineInput} />
+                    ) : isEditableYear ? (
+                      <span onClick={() => startEdit(v)} style={styles.editableCell}>{fmtN(v.budget_revenue)}</span>
+                    ) : (
+                      <span>{fmtN(v.budget_revenue)}</span>
+                    )}
+                  </td>
+                  <td className="num" style={styles.td}>{fmtN(v.budget_gp)}</td>
+                  <td className="num" style={styles.td}>{fmtPct(v.gp_pct)}</td>
+                  <td style={{ ...styles.td, textAlign: "center", whiteSpace: "nowrap" }}>
+                    {isEditableYear ? (
+                      <>
+                        <button onClick={() => onPlan(v)} style={styles.planBtn}><Sliders size={12} style={{ marginRight: 5 }} />Plan FY</button>
+                        <button onClick={() => onRemoveVendor(v.vendor)} style={{ ...styles.iconBtnGhost, marginLeft: 6 }} title={`Remove ${v.vendor} from ${activeBudgetingYear}`}><X size={13} /></button>
+                      </>
+                    ) : (
+                      <button disabled style={{ ...styles.planBtn, opacity: 0.4, cursor: "not-allowed" }} title={`Read-only — editing enabled for ${activeBudgetingYear} only`}><Sliders size={12} style={{ marginRight: 5 }} />Plan FY</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
             </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "2px solid #111111" }}>
+                <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget_revenue)}</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget_gp)}</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtPct(totals.budget_gp_pct)}</td>
+                <td style={styles.td}></td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </div>
@@ -804,40 +1407,78 @@ function VendorsTab({ rows, search, setSearch, sortKey, sortDir, toggleSort, edi
   );
 }
 
+function AddVendorModal({ onCancel, onAdd, year }) {
+  const [name, setName] = useState("");
+  const [startMonth, setStartMonth] = useState(1);
+  return (
+    <div style={styles.modalOverlay} onClick={onCancel}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>Add Vendor for {year}</div>
+          <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>Only affects the active budgeting year.</div>
+        <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6B6B", display: "block", marginBottom: 4 }}>Vendor name<RequiredStar /></label>
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Wiz" style={styles.modalInput} />
+        <label style={{ fontSize: 12, fontWeight: 600, color: "#6B6B6B", display: "block", margin: "12px 0 4px" }}>Budget start month</label>
+        <select value={startMonth} onChange={(e) => setStartMonth(parseInt(e.target.value, 10))} style={styles.modalInput}>
+          {MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}{i === 0 ? " (full year)" : ""}</option>)}
+        </select>
+        <div style={{ fontSize: 11.5, color: "#6B6B6B", marginTop: 8 }}>
+          Not every vendor starts from January — this greys out earlier months in the Plan FY grid so budget is only entered from the actual start month onward.
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
+          <button onClick={() => name.trim() && onAdd(name.trim(), startMonth)} style={styles.primaryBtn} disabled={!name.trim()}>Add Vendor</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RegionsTab({ regions }) {
-  const data = regions.map(r => ({ region: r.region, Budget: r.budget_revenue, Actual: r.actual_revenue_ytd }));
+  const { fmtN } = useNumberUnit();
+  const totals = regions.reduce((t, r) => ({
+    budget_revenue: t.budget_revenue + r.budget_revenue, budget_gp: t.budget_gp + r.budget_gp,
+  }), { budget_revenue: 0, budget_gp: 0 });
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Region-wise Revenue — Budget vs YTD Actual</div>
-        <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>Rolled up from each vendor's planned month × country grid where set; unplanned vendors are attributed using the company-wide historical split.</div>
-        <ResponsiveContainer width="100%" height={340}>
-          <BarChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 40 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-            <XAxis dataKey="region" stroke="#6B6B6B" fontSize={11} angle={-30} textAnchor="end" interval={0} />
-            <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtCompact(v)} width={64} />
-            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
-            <Legend />
-            <Bar dataKey="Budget" fill="#6B6B6B" radius={[4, 4, 0, 0]} />
-            <Bar dataKey="Actual" fill="#C00000" radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>
+        Rolled up from each vendor's planned month × country grid where set; unplanned vendors are attributed using the company-wide historical split. This is the active budgeting year — there's no actuals or variance to show yet.
       </div>
       <div style={styles.panel}>
-        <div style={{ overflowX: "auto" }}>
+        <div style={styles.tableScroll}>
           <table style={styles.table}>
-            <thead><tr><th style={{ ...styles.th, textAlign: "left" }}>Country / Region</th><th style={styles.th}>Budget Rev</th><th style={styles.th}>Actual Rev (YTD)</th><th style={styles.th}>Budget GP</th><th style={styles.th}>Actual GP (YTD)</th></tr></thead>
+            <thead>
+              <tr>
+                <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>Country / Region</th>
+                <th style={{ ...styles.th, textAlign: "right" }}>Budget Revenue</th>
+                <th style={{ ...styles.th, textAlign: "right" }}>Budget GP</th>
+                <th style={{ ...styles.th, textAlign: "right" }}>GP%</th>
+              </tr>
+            </thead>
             <tbody>
-              {regions.map(r => (
-                <tr key={r.region} className="row-hover" style={styles.tr}>
-                  <td style={{ ...styles.td, textAlign: "left", fontWeight: 600 }}>{r.region}</td>
-                  <td className="num" style={styles.td}>{fmtCompact(r.budget_revenue)}</td>
-                  <td className="num" style={styles.td}>{fmtCompact(r.actual_revenue_ytd)}</td>
-                  <td className="num" style={styles.td}>{fmtCompact(r.budget_gp)}</td>
-                  <td className="num" style={styles.td}>{fmtCompact(r.actual_gp_ytd)}</td>
-                </tr>
-              ))}
+              {regions.map(r => {
+                const budgetGpPct = r.budget_revenue ? r.budget_gp / r.budget_revenue : 0;
+                return (
+                  <tr key={r.region} className="row-hover" style={styles.tr}>
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.region}</td>
+                    <td className="num" style={styles.td}>{fmtN(r.budget_revenue)}</td>
+                    <td className="num" style={styles.td}>{fmtN(r.budget_gp)}</td>
+                    <td className="num" style={styles.td}>{fmtPct(budgetGpPct)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "2px solid #111111" }}>
+                <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget_revenue)}</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget_gp)}</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtPct(totals.budget_revenue ? totals.budget_gp / totals.budget_revenue : 0)}</td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </div>
@@ -846,32 +1487,18 @@ function RegionsTab({ regions }) {
 }
 
 function PLTab({ alloc }) {
+  const { fmtN } = useNumberUnit();
   const [view, setView] = useState("monthly"); // monthly | vendor | country
-  const [dqOpen, setDqOpen] = useState(false);
   const companyGpPct = alloc.totalGP ? alloc.totalGP / alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0) : 0;
   const totalRevenue = alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0);
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={styles.kpiGrid}>
-        <KpiCard label="FY Budget GP" value={fmtCompact(alloc.totalGP)} />
-        <KpiCard label="Total SGA Allocated" value={fmtCompact(alloc.totalSGA)} sub={`${fmtCompact(alloc.empAnnual)} employee · ${fmtCompact(alloc.nonEmpAnnual)} non-employee`} />
-        <KpiCard label="FY Budget EBID" value={fmtCompact(alloc.totalEbid)} sub={`${fmtPct(totalRevenue ? alloc.totalEbid / totalRevenue : 0)} of revenue`} trend={alloc.totalEbid >= 0 ? "up" : "down"} />
+        <KpiCard label="FY Budget GP" value={fmtN(alloc.totalGP)} />
+        <KpiCard label="Total SGA Allocated" value={fmtN(alloc.totalSGA)} sub={`${fmtN(alloc.empAnnual)} employee · ${fmtN(alloc.nonEmpAnnual)} non-employee`} />
+        <KpiCard label="FY Budget EBID" value={fmtN(alloc.totalEbid)} sub={`${fmtPct(totalRevenue ? alloc.totalEbid / totalRevenue : 0)} of revenue`} trend={alloc.totalEbid >= 0 ? "up" : "down"} />
         <KpiCard label="Blended GP% → EBID%" value={fmtPct(companyGpPct)} sub={`down to ${fmtPct(totalRevenue ? alloc.totalEbid / totalRevenue : 0)} EBID%`} />
-      </div>
-
-      <div style={styles.dataQualityBanner}>
-        <div>
-          <b>Data quality note:</b> employee vendor/country assignments are read from your real 2026 file and matched against the budget vendor &amp; region lists automatically.
-          {" "}{DATA_QUALITY.employeesWithVendorIssue} employees had at least one vendor term that didn't resolve cleanly, {DATA_QUALITY.employeesWithCountryIssue} had a country term that didn't — those fall back to a company-wide GP split rather than losing the cost. Real deployment would need these cleaned up in the source data.
-        </div>
-        <button onClick={() => setDqOpen(o => !o)} style={styles.expandBtn}>{dqOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} {dqOpen ? "Hide" : "Show"} unmatched terms</button>
-        {dqOpen && (
-          <div style={{ marginTop: 8, fontSize: 11.5, color: "#6B6B6B" }}>
-            <div><b>Vendor terms:</b> {DATA_QUALITY.unmatchedVendorTerms.join(", ")}</div>
-            <div style={{ marginTop: 4 }}><b>Country terms:</b> {DATA_QUALITY.unmatchedCountryTerms.join(", ")}</div>
-          </div>
-        )}
       </div>
 
       <div style={styles.plViewToggle}>
@@ -884,28 +1511,28 @@ function PLTab({ alloc }) {
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Monthly P&amp;L — Revenue → GP → SGA → EBID</div>
           <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 10 }}>GP% held constant per vendor across months (monthly GP isn't tracked as its own grid — derived from each vendor's annual GP% × monthly revenue). Depreciation and interest sit below EBID at the company level, not shown here.</div>
-          <div style={{ overflowX: "auto" }}>
+          <div style={styles.tableScroll}>
             <table style={styles.table}>
               <thead><tr><th style={{ ...styles.th, textAlign: "left" }}>Month</th><th style={styles.th}>Revenue</th><th style={styles.th}>GP</th><th style={styles.th}>GP%</th><th style={styles.th}>SGA</th><th style={styles.th}>EBID</th><th style={styles.th}>EBID%</th></tr></thead>
               <tbody>
                 {alloc.monthlyPL.map(m => (
                   <tr key={m.month} className="row-hover" style={styles.tr}>
                     <td style={{ ...styles.td, textAlign: "left", fontWeight: 600 }}>{m.month}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(m.revenue)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(m.gp)}</td>
+                    <td className="num" style={styles.td}>{fmtN(m.revenue)}</td>
+                    <td className="num" style={styles.td}>{fmtN(m.gp)}</td>
                     <td className="num" style={styles.td}>{fmtPct(m.revenue ? m.gp / m.revenue : 0)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(m.sga)}</td>
-                    <td className="num" style={{ ...styles.td, color: m.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtCompact(m.ebid)}</td>
+                    <td className="num" style={styles.td}>{fmtN(m.sga)}</td>
+                    <td className="num" style={{ ...styles.td, color: m.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtN(m.ebid)}</td>
                     <td className="num" style={{ ...styles.td, color: m.ebid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(m.revenue ? m.ebid / m.revenue : 0)}</td>
                   </tr>
                 ))}
                 <tr style={{ borderTop: "2px solid #E0E0E0" }}>
                   <td style={{ ...styles.td, textAlign: "left", fontWeight: 700 }}>FY Total</td>
-                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtCompact(alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0))}</td>
-                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtCompact(alloc.totalGP)}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.totalGP)}</td>
                   <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtPct(companyGpPct)}</td>
-                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtCompact(alloc.totalSGA)}</td>
-                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtCompact(alloc.totalEbid)}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.totalSGA)}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtN(alloc.totalEbid)}</td>
                   <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(totalRevenue ? alloc.totalEbid / totalRevenue : 0)}</td>
                 </tr>
               </tbody>
@@ -918,21 +1545,31 @@ function PLTab({ alloc }) {
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Vendor-wise EBID</div>
           <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 10 }}>SGA = non-employee costs allocated by GP share + employee cost allocated within each employee's assigned vendor list (spec §7).</div>
-          <div style={{ overflowX: "auto" }}>
+          <div style={styles.tableScroll}>
             <table style={styles.table}>
               <thead><tr><th style={{ ...styles.th, textAlign: "left" }}>Vendor</th><th style={styles.th}>Budget Rev</th><th style={styles.th}>Budget GP</th><th style={styles.th}>SGA Allocated</th><th style={styles.th}>EBID</th><th style={styles.th}>EBID%</th></tr></thead>
               <tbody>
                 {alloc.vendorPL.map(v => (
                   <tr key={v.vendor} className="row-hover" style={styles.tr}>
                     <td style={{ ...styles.td, textAlign: "left", fontWeight: 600 }}>{v.vendor}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(v.revenue)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(v.gp)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(v.sga)}</td>
-                    <td className="num" style={{ ...styles.td, color: v.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtCompact(v.ebid)}</td>
+                    <td className="num" style={styles.td}>{fmtN(v.revenue)}</td>
+                    <td className="num" style={styles.td}>{fmtN(v.gp)}</td>
+                    <td className="num" style={styles.td}>{fmtN(v.sga)}</td>
+                    <td className="num" style={{ ...styles.td, color: v.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtN(v.ebid)}</td>
                     <td className="num" style={{ ...styles.td, color: v.ebid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(v.revenue ? v.ebid / v.revenue : 0)}</td>
                   </tr>
                 ))}
               </tbody>
+              <tfoot>
+                <tr style={{ borderTop: "2px solid #111111" }}>
+                  <td style={{ ...styles.td, textAlign: "left", fontWeight: 700 }}>Total</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.vendorPL.reduce((s, v) => s + v.revenue, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.vendorPL.reduce((s, v) => s + v.gp, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.vendorPL.reduce((s, v) => s + v.sga, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtN(alloc.vendorPL.reduce((s, v) => s + v.ebid, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(totalRevenue ? alloc.vendorPL.reduce((s, v) => s + v.ebid, 0) / totalRevenue : 0)}</td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         </div>
@@ -942,21 +1579,31 @@ function PLTab({ alloc }) {
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Country-wise EBID</div>
           <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 10 }}>SGA = non-employee costs allocated by GP share + employee cost allocated within each employee's assigned country list (spec §7) — independent of the vendor-wise allocation above.</div>
-          <div style={{ overflowX: "auto" }}>
+          <div style={styles.tableScroll}>
             <table style={styles.table}>
               <thead><tr><th style={{ ...styles.th, textAlign: "left" }}>Country</th><th style={styles.th}>Budget Rev</th><th style={styles.th}>Budget GP</th><th style={styles.th}>SGA Allocated</th><th style={styles.th}>EBID</th><th style={styles.th}>EBID%</th></tr></thead>
               <tbody>
                 {alloc.countryPL.map(r => (
                   <tr key={r.region} className="row-hover" style={styles.tr}>
                     <td style={{ ...styles.td, textAlign: "left", fontWeight: 600 }}>{r.region}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(r.revenue)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(r.gp)}</td>
-                    <td className="num" style={styles.td}>{fmtCompact(r.sga)}</td>
-                    <td className="num" style={{ ...styles.td, color: r.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtCompact(r.ebid)}</td>
+                    <td className="num" style={styles.td}>{fmtN(r.revenue)}</td>
+                    <td className="num" style={styles.td}>{fmtN(r.gp)}</td>
+                    <td className="num" style={styles.td}>{fmtN(r.sga)}</td>
+                    <td className="num" style={{ ...styles.td, color: r.ebid >= 0 ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtN(r.ebid)}</td>
                     <td className="num" style={{ ...styles.td, color: r.ebid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(r.revenue ? r.ebid / r.revenue : 0)}</td>
                   </tr>
                 ))}
               </tbody>
+              <tfoot>
+                <tr style={{ borderTop: "2px solid #111111" }}>
+                  <td style={{ ...styles.td, textAlign: "left", fontWeight: 700 }}>Total</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.countryPL.reduce((s, r) => s + r.revenue, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.countryPL.reduce((s, r) => s + r.gp, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(alloc.countryPL.reduce((s, r) => s + r.sga, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtN(alloc.countryPL.reduce((s, r) => s + r.ebid, 0))}</td>
+                  <td className="num" style={{ ...styles.td, fontWeight: 700, color: alloc.totalEbid >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtPct(totalRevenue ? alloc.countryPL.reduce((s, r) => s + r.ebid, 0) / totalRevenue : 0)}</td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         </div>
@@ -965,9 +1612,2679 @@ function PLTab({ alloc }) {
   );
 }
 
-function VersionsTab({ versions, onLoad, onSaveClick }) {
+// ---- Other Expenses Budgeting Module — Phase 1 (sync + mapping) -----------
+// Growth assumptions, agreement registers, the trend/agreement budget
+// engine, and the actual-vs-budget dashboard are NOT built yet — this tab
+// currently only covers getting ledger data in and mapped to categories,
+// per the spec's own stated build order (mapping first, since nothing else
+// can calculate meaningfully until accounts are categorized).
+function OtherExpensesTab({ showToast, year, isEditableYear, activeBudgetingYear }) {
+  const { fmtN } = useNumberUnit();
+  const [view, setView] = useState("dashboard"); // dashboard | agreements | growth | budget
+  const [rollup, setRollup] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [unmapped, setUnmapped] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [newCategoryParent, setNewCategoryParent] = useState("");
+  const [expandedId, setExpandedId] = useState(null);
+  const [agreements, setAgreements] = useState([]);
+  const [growthMap, setGrowthMap] = useState({});
+  const [budgetLines, setBudgetLines] = useState([]);
+  const [generating, setGenerating] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [rollupRows, cats, unmappedRows, agreementRows, growth, budget] = await Promise.all([
+        getCategoryRollup(year), getExpenseCategories(), getUnmappedAccounts(),
+        getExpenseAgreements(), getGrowthAssumptions(year), getOtherExpensesBudget(year),
+      ]);
+      setRollup(rollupRows);
+      setCategories(cats);
+      setUnmapped(unmappedRows);
+      setAgreements(agreementRows);
+      setGrowthMap(growth);
+      setBudgetLines(budget);
+    } catch (e) {
+      console.error("OtherExpensesTab load failed:", e);
+      showToast(`Couldn't load Other Expenses data: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, [year]);
+
+  const topLevelCategories = categories.filter(c => !c.parentCategoryId);
+  const subcategoriesOf = (parentId) => categories.filter(c => c.parentCategoryId === parentId);
+
+  const handleSync = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const result = await syncOtherExpensesLedgerNow();
+      await load();
+      showToast(`Synced ${result.ledgerRecordsUpdated} ledger records — ${result.autoMappedFromGrouping} new + ${result.backfilledFromGrouping} existing accounts auto-mapped from Grouping.`);
+    } catch (e) {
+      showToast(`Ledger sync failed: ${e.message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleAddCategory = async () => {
+    if (!newCategoryName.trim()) return;
+    try {
+      await addExpenseCategory(newCategoryName, newCategoryParent || null);
+      setNewCategoryName(""); setNewCategoryParent("");
+      await load();
+    } catch (e) {
+      showToast(`Couldn't add category: ${e.message}`);
+    }
+  };
+
+  const handleRemoveCategory = async (id, name) => {
+    if (!window.confirm(`Remove category "${name}"? This won't un-map accounts already assigned to it.`)) return;
+    try {
+      await removeExpenseCategory(id);
+      await load();
+    } catch (e) {
+      showToast(`Couldn't remove category: ${e.message}`);
+    }
+  };
+
+  const handleMap = async (accountId, categoryId, subcategoryId) => {
+    try {
+      await setGlAccountMapping(accountId, categoryId, subcategoryId, auth.currentUser?.email || "unknown");
+      setUnmapped(prev => prev.filter(a => a.id !== accountId)); // optimistic — leaves the queue immediately
+      await load(); // refresh the rollup too, since this account now contributes to a category total
+    } catch (e) {
+      showToast(`Couldn't save mapping: ${e.message}`);
+    }
+  };
+
+  const handleRemap = async (accountId, categoryId, subcategoryId) => {
+    try {
+      await setGlAccountMapping(accountId, categoryId, subcategoryId, auth.currentUser?.email || "unknown");
+      await load();
+      showToast("Re-mapped");
+    } catch (e) {
+      showToast(`Couldn't re-map: ${e.message}`);
+    }
+  };
+
+  const grandTotal = rollup.reduce((s, c) => s + c.total, 0);
+
+  const handleSetGrowth = async (categoryId, pct) => {
+    try {
+      await setGrowthAssumption(year, categoryId, pct);
+      setGrowthMap(prev => ({ ...prev, [categoryId]: pct }));
+    } catch (e) {
+      showToast(`Couldn't save growth assumption: ${e.message}`);
+    }
+  };
+
+  const handleGenerate = async () => {
+    if (!isEditableYear) { showToast(`Budget generation is only available for ${activeBudgetingYear}.`); return; }
+    if (!window.confirm(`Generate the ${year} Other Expenses budget from last year's actuals + growth% + agreements? This overwrites any existing generated lines (manual overrides on categories you haven't touched are preserved as their own separate edit — this just recalculates the base).`)) return;
+    setGenerating(true);
+    try {
+      const result = await generateOtherExpensesBudget(year);
+      await load();
+      showToast(`Generated ${result.linesGenerated} budget lines — ${result.agreementDriven} from agreements, ${result.trendDriven} from trend, ${result.skipped} skipped (no data).`);
+    } catch (e) {
+      showToast(`Budget generation failed: ${e.message}`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleOverrideBudget = async (lineId, monthIndex, amount) => {
+    if (!isEditableYear) { showToast(`Editing is only enabled for ${activeBudgetingYear}.`); return; }
+    try {
+      await overrideOtherExpensesBudgetLine(year, lineId, monthIndex, amount, auth.currentUser?.email || "unknown");
+      await load();
+    } catch (e) {
+      showToast(`Couldn't save override: ${e.message}`);
+    }
+  };
+
+  const handleSaveAgreement = async (fields, existingId) => {
+    try {
+      if (existingId) await updateExpenseAgreement(existingId, fields);
+      else await addExpenseAgreement(fields);
+      await load();
+      showToast(existingId ? "Agreement updated" : "Agreement added");
+    } catch (e) {
+      showToast(`Couldn't save agreement: ${e.message}`);
+    }
+  };
+
+  const handleRemoveAgreement = async (id, name) => {
+    if (!window.confirm(`Remove agreement "${name}"?`)) return;
+    try {
+      await removeExpenseAgreement(id);
+      await load();
+    } catch (e) {
+      showToast(`Couldn't remove agreement: ${e.message}`);
+    }
+  };
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={styles.plViewToggle}>
+        {[["dashboard", "Dashboard"], ["agreements", "Agreements"], ["growth", "Growth Assumptions"], ["budget", `Budget & Variance (${year})`]].map(([k, label]) => (
+          <button key={k} onClick={() => setView(k)} style={{ ...styles.plToggleBtn, ...(view === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+        ))}
+      </div>
+
+      {view === "dashboard" && (
+      <>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>
+          Actuals by category for {year}, from the synced GL ledger. Categories are auto-created from Zoho's "Grouping" field, and accounts with a Grouping value are auto-mapped — only accounts with no Grouping need manual mapping below.
+        </div>
+        <button onClick={handleSync} disabled={syncing} style={styles.planBtn}>
+          <RefreshCw size={12} style={{ marginRight: 5, ...(syncing ? { animation: "spin 1s linear infinite" } : {}) }} />
+          {syncing ? "Syncing…" : "Sync Ledger"}
+        </button>
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Categories — {year} Actuals by Month</div>
+        {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : rollup.length === 0 || grandTotal === 0 ? (
+          <div style={{ fontSize: 12, color: "#6B6B6B" }}>
+            No mapped actuals for {year} yet. {topLevelCategories.length === 0 ? 'Click "Sync Ledger" above to pull data and auto-create categories from Grouping.' : "Map the accounts below to see them roll up here."}
+          </div>
+        ) : (
+          <div style={styles.tableScroll}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Category</th>
+                  {MONTHS.map(m => <th key={m} style={styles.th}>{m}</th>)}
+                  <th style={{ ...styles.th, fontWeight: 700 }}>Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rollup.map(cat => (
+                  <CategoryRollupRow
+                    key={cat.id} category={cat} depth={0} expandedId={expandedId} setExpandedId={setExpandedId}
+                    topLevelCategories={topLevelCategories} subcategoriesOf={subcategoriesOf} onRemap={handleRemap} fmtN={fmtN}
+                  />
+                ))}
+              </tbody>
+              <tfoot>
+                <tr style={{ borderTop: "2px solid #111111" }}>
+                  <td style={{ ...styles.td, textAlign: "left", fontWeight: 700 }}>Total</td>
+                  {MONTHS.map((_, i) => (
+                    <td key={i} className="num" style={{ ...styles.td, fontWeight: 700 }}>
+                      {fmtN(rollup.reduce((s, c) => s + (c.monthly[i] || 0), 0))}
+                    </td>
+                  ))}
+                  <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(grandTotal)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Categories</div>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>Auto-created from Grouping during sync — add more manually if needed (e.g. to split a broad Grouping into finer subcategories).</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+          <input value={newCategoryName} onChange={(e) => setNewCategoryName(e.target.value)} placeholder="New category or subcategory name" style={{ ...styles.chatInput, background: "#FFFFFF", maxWidth: 260 }} />
+          <select value={newCategoryParent} onChange={(e) => setNewCategoryParent(e.target.value)} style={styles.yearSelect}>
+            <option value="">— Top-level category —</option>
+            {topLevelCategories.map(c => <option key={c.id} value={c.id}>Subcategory of: {c.name}</option>)}
+          </select>
+          <button onClick={handleAddCategory} style={styles.primaryBtn} disabled={!newCategoryName.trim()}>Add</button>
+        </div>
+        {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : topLevelCategories.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#6B6B6B" }}>No categories yet — click "Sync Ledger" above, or add one manually.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {topLevelCategories.map(cat => (
+              <div key={cat.id}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontWeight: 600, fontSize: 13.5 }}>{cat.name}</span>
+                  <button onClick={() => handleRemoveCategory(cat.id, cat.name)} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }} title={`Remove ${cat.name}`}><X size={11} /></button>
+                </div>
+                {subcategoriesOf(cat.id).length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4, marginLeft: 16 }}>
+                    {subcategoriesOf(cat.id).map(sub => (
+                      <span key={sub.id} style={{ fontSize: 11.5, color: "#6B6B6B", background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 6, padding: "2px 8px", display: "flex", alignItems: "center", gap: 5 }}>
+                        {sub.name}
+                        <X size={10} style={{ cursor: "pointer" }} onClick={() => handleRemoveCategory(sub.id, sub.name)} />
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Unmapped GL Accounts {unmapped.length > 0 && `(${unmapped.length})`}</div>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>Accounts with no Grouping value in Zoho — these need a category assigned manually.</div>
+        {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : unmapped.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#1B8A3A" }}>✓ Every synced GL account is mapped to a category.</div>
+        ) : (
+          <div style={styles.tableScroll}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Entity</th>
+                  <th style={{ ...styles.th, textAlign: "left" }}>GL Code</th>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Account Name</th>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Type</th>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Category</th>
+                  <th style={styles.th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {unmapped.map(a => (
+                  <MappingRow key={a.id} account={a} topLevelCategories={topLevelCategories} subcategoriesOf={subcategoriesOf} onMap={handleMap} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      </>
+      )}
+
+      {view === "agreements" && (
+        <AgreementsView
+          agreements={agreements} categories={categories} topLevelCategories={topLevelCategories} subcategoriesOf={subcategoriesOf}
+          onSave={handleSaveAgreement} onRemove={handleRemoveAgreement} fmtN={fmtN}
+        />
+      )}
+
+      {view === "growth" && (
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Growth Assumptions — {year}</div>
+          <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
+            One growth% per category, applied uniformly across all entities. Used by the trend-driven budget calculation (last year's actual × growth%) for any category without an active agreement. Not restricted to the active budgeting year — set assumptions ahead of time if useful.
+          </div>
+          {topLevelCategories.length === 0 ? (
+            <div style={{ fontSize: 12, color: "#6B6B6B" }}>No categories yet — sync the ledger first.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {[...topLevelCategories, ...categories.filter(c => c.parentCategoryId)].map(cat => (
+                <div key={cat.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ width: 260, fontSize: 13, fontWeight: cat.parentCategoryId ? 400 : 600, paddingLeft: cat.parentCategoryId ? 16 : 0, color: cat.parentCategoryId ? "#6B6B6B" : "#111111" }}>{cat.name}</span>
+                  <input type="number" defaultValue={growthMap[cat.id] || 0} onBlur={(e) => handleSetGrowth(cat.id, parseFloat(e.target.value) || 0)} style={{ ...styles.gridCellInput, position: "static", width: 70 }} />
+                  <span style={{ fontSize: 12, color: "#6B6B6B" }}>%</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {view === "budget" && (
+        <BudgetVarianceView
+          year={year} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear}
+          budgetLines={budgetLines} rollup={rollup} categories={categories}
+          generating={generating} onGenerate={handleGenerate} onOverride={handleOverrideBudget} fmtN={fmtN}
+        />
+      )}
+    </div>
+  );
+}
+
+// One row per category (and, when expanded, one sub-row per subcategory and
+// per contributing GL account) — the "click legal cost, see it expand into
+// what rolls up to that number, with an option to re-map" behavior.
+function CategoryRollupRow({ category, depth, expandedId, setExpandedId, topLevelCategories, subcategoriesOf, onRemap, fmtN }) {
+  const isExpanded = expandedId === category.id;
+  const hasChildren = (category.subcategories && category.subcategories.length > 0) || (category.accounts && category.accounts.length > 0);
+  return (
+    <>
+      <tr className="row-hover" style={{ ...styles.tr, cursor: hasChildren ? "pointer" : "default" }} onClick={() => hasChildren && setExpandedId(isExpanded ? null : category.id)}>
+        <td style={{ ...styles.td, textAlign: "left", fontWeight: depth === 0 ? 600 : 500, paddingLeft: 16 + depth * 18 }}>
+          {hasChildren && (isExpanded ? <ChevronDown size={12} style={{ marginRight: 5, verticalAlign: -1 }} /> : <ChevronRight size={12} style={{ marginRight: 5, verticalAlign: -1 }} />)}
+          {category.name}
+        </td>
+        {category.monthly.map((v, i) => <td key={i} className="num" style={styles.td}>{v ? fmtN(v) : "—"}</td>)}
+        <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(category.total)}</td>
+      </tr>
+      {isExpanded && (
+        <>
+          {(category.subcategories || []).map(sub => (
+            <CategoryRollupRow key={sub.id} category={sub} depth={depth + 1} expandedId={expandedId} setExpandedId={setExpandedId} topLevelCategories={topLevelCategories} subcategoriesOf={subcategoriesOf} onRemap={onRemap} fmtN={fmtN} />
+          ))}
+          {(category.accounts || []).filter(a => a.categoryId === category.id).map(acc => (
+            <tr key={acc.id} style={{ background: "#FAFAF9" }}>
+              <td style={{ ...styles.td, textAlign: "left", fontSize: 11.5, color: "#6B6B6B", paddingLeft: 16 + (depth + 1) * 18 }}>
+                {acc.entity} · {acc.glCode} · {acc.glName}
+              </td>
+              <td colSpan={12} style={{ ...styles.td, fontSize: 11, color: "#8A8A8A" }}></td>
+              <td className="num" style={{ ...styles.td, fontSize: 11.5 }}>
+                {fmtN(acc.monthlyTotal)}
+                <RemapControl account={acc} topLevelCategories={topLevelCategories} subcategoriesOf={subcategoriesOf} onRemap={onRemap} />
+              </td>
+            </tr>
+          ))}
+        </>
+      )}
+    </>
+  );
+}
+
+function RemapControl({ account, topLevelCategories, subcategoriesOf, onRemap }) {
+  const [open, setOpen] = useState(false);
+  const [categoryId, setCategoryId] = useState(account.categoryId);
+  const [subcategoryId, setSubcategoryId] = useState(account.subcategoryId || "");
+  const subs = categoryId ? subcategoriesOf(categoryId) : [];
+  if (!open) return <button onClick={(e) => { e.stopPropagation(); setOpen(true); }} style={{ ...styles.iconBtnGhost, width: 20, height: 20, marginLeft: 6 }} title="Re-map this account"><Sliders size={10} /></button>;
+  return (
+    <span onClick={(e) => e.stopPropagation()} style={{ display: "inline-flex", gap: 4, marginLeft: 6 }}>
+      <select value={categoryId} onChange={(e) => { setCategoryId(e.target.value); setSubcategoryId(""); }} style={{ ...styles.yearSelect, fontSize: 10.5, padding: "2px 6px" }}>
+        {topLevelCategories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+      </select>
+      {subs.length > 0 && (
+        <select value={subcategoryId} onChange={(e) => setSubcategoryId(e.target.value)} style={{ ...styles.yearSelect, fontSize: 10.5, padding: "2px 6px" }}>
+          <option value="">(none)</option>
+          {subs.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+      )}
+      <button onClick={() => { onRemap(account.id, categoryId, subcategoryId); setOpen(false); }} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }} title="Save"><Check size={10} /></button>
+    </span>
+  );
+}
+
+function MappingRow({ account, topLevelCategories, subcategoriesOf, onMap }) {
+  const [categoryId, setCategoryId] = useState("");
+  const [subcategoryId, setSubcategoryId] = useState("");
+  const subs = categoryId ? subcategoriesOf(categoryId) : [];
+  return (
+    <tr className="row-hover" style={styles.tr}>
+      <td style={{ ...styles.td, textAlign: "left" }}>{account.entity}</td>
+      <td style={{ ...styles.td, textAlign: "left" }}>{account.glCode}</td>
+      <td style={{ ...styles.td, textAlign: "left" }}>{account.glName}</td>
+      <td style={{ ...styles.td, textAlign: "left", fontSize: 11, color: "#6B6B6B" }}>{account.accountType}</td>
+      <td style={{ ...styles.td, textAlign: "left" }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          <select value={categoryId} onChange={(e) => { setCategoryId(e.target.value); setSubcategoryId(""); }} style={{ ...styles.yearSelect, fontSize: 11.5, padding: "4px 8px" }}>
+            <option value="">Choose category…</option>
+            {topLevelCategories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          {subs.length > 0 && (
+            <select value={subcategoryId} onChange={(e) => setSubcategoryId(e.target.value)} style={{ ...styles.yearSelect, fontSize: 11.5, padding: "4px 8px" }}>
+              <option value="">(no subcategory)</option>
+              {subs.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          )}
+        </div>
+      </td>
+      <td style={{ ...styles.td, textAlign: "center" }}>
+        <button onClick={() => onMap(account.id, categoryId, subcategoryId)} disabled={!categoryId} style={{ ...styles.planBtn, opacity: categoryId ? 1 : 0.4, cursor: categoryId ? "pointer" : "not-allowed" }}>Map</button>
+      </td>
+    </tr>
+  );
+}
+
+// ---- Agreements (rent / consultant / subscription, unified) ---------------
+function AgreementsView({ agreements, categories, topLevelCategories, subcategoriesOf, onSave, onRemove, fmtN }) {
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState(null); // agreement object being edited, or null for "new"
+  const categoryName = (id) => categories.find(c => c.id === id)?.name || "(uncategorized)";
+
+  return (
+    <div style={styles.panel}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={styles.panelTitle}>Rent / Consultant / Subscription Agreements</div>
+        <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Agreement</button>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
+        An active agreement takes precedence over the trend calculation for its category — its terms drive the budget number directly.
+      </div>
+
+      {formOpen && (
+        <AgreementForm
+          topLevelCategories={topLevelCategories}
+          initial={editing}
+          onCancel={() => setFormOpen(false)}
+          onSave={(fields) => { onSave(fields, editing?.id); setFormOpen(false); }}
+        />
+      )}
+
+      {agreements.length === 0 ? (
+        <div style={{ fontSize: 12, color: "#6B6B6B" }}>No agreements yet.</div>
+      ) : (
+        <div style={styles.tableScroll}>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={{ ...styles.th, textAlign: "left" }}>Type</th>
+                <th style={{ ...styles.th, textAlign: "left" }}>Name</th>
+                <th style={{ ...styles.th, textAlign: "left" }}>Entity</th>
+                <th style={{ ...styles.th, textAlign: "left" }}>Category</th>
+                <th style={styles.th}>Amount</th>
+                <th style={{ ...styles.th, textAlign: "left" }}>Active</th>
+                <th style={styles.th}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {agreements.map(a => (
+                <tr key={a.id} className="row-hover" style={styles.tr}>
+                  <td style={{ ...styles.td, textAlign: "left", textTransform: "capitalize" }}>{a.type}</td>
+                  <td style={{ ...styles.td, textAlign: "left" }}>{a.name}</td>
+                  <td style={{ ...styles.td, textAlign: "left" }}>{a.entity || "\u2014"}</td>
+                  <td style={{ ...styles.td, textAlign: "left" }}>{categoryName(a.categoryId)}</td>
+                  <td className="num" style={styles.td}>{fmtN(a.monthlyRent || a.monthlyAmount || a.fee || 0)}{a.type === "consultant" ? ` /${a.frequency?.replace("_", "-")}` : " /mo"}</td>
+                  <td style={{ ...styles.td, textAlign: "left" }}>{a.activeFlag ? <span style={{ color: "#1B8A3A" }}>Active</span> : <span style={{ color: "#8A8A8A" }}>Inactive</span>}</td>
+                  <td style={{ ...styles.td, textAlign: "center", whiteSpace: "nowrap" }}>
+                    <button onClick={() => { setEditing(a); setFormOpen(true); }} style={{ ...styles.iconBtnGhost, width: 22, height: 22 }} title="Edit"><Sliders size={11} /></button>
+                    <button onClick={() => onRemove(a.id, a.name)} style={{ ...styles.iconBtnGhost, width: 22, height: 22, marginLeft: 4 }} title="Remove"><X size={11} /></button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgreementForm({ topLevelCategories, initial, onCancel, onSave }) {
+  const [type, setType] = useState(initial?.type || "rent");
+  const [name, setName] = useState(initial?.name || "");
+  const [entity, setEntity] = useState(initial?.entity || "");
+  const [categoryId, setCategoryId] = useState(initial?.categoryId || "");
+  const [activeFlag, setActiveFlag] = useState(initial?.activeFlag ?? true);
+  const [monthlyRent, setMonthlyRent] = useState(initial?.monthlyRent || "");
+  const [escalationPct, setEscalationPct] = useState(initial?.escalationPct || "");
+  const [leaseStart, setLeaseStart] = useState(initial?.leaseStart || "");
+  const [leaseEnd, setLeaseEnd] = useState(initial?.leaseEnd || "");
+  const [fee, setFee] = useState(initial?.fee || "");
+  const [frequency, setFrequency] = useState(initial?.frequency || "monthly");
+  const [oneTimeMonth, setOneTimeMonth] = useState(initial?.oneTimeMonth || 12);
+  const [contractStart, setContractStart] = useState(initial?.contractStart || "");
+  const [contractEnd, setContractEnd] = useState(initial?.contractEnd || "");
+  const [monthlyAmount, setMonthlyAmount] = useState(initial?.monthlyAmount || "");
+  const [billingCycle, setBillingCycle] = useState(initial?.billingCycle || "monthly");
+  const [renewalDate, setRenewalDate] = useState(initial?.renewalDate || "");
+
+  const handleSave = () => {
+    if (!name.trim() || !categoryId) return;
+    const base = { type, name: name.trim(), entity: entity.trim() || null, categoryId, activeFlag };
+    const fields = type === "rent" ? { ...base, monthlyRent: parseFloat(monthlyRent) || 0, escalationPct: parseFloat(escalationPct) || 0, leaseStart: leaseStart || null, leaseEnd: leaseEnd || null }
+      : type === "consultant" ? { ...base, fee: parseFloat(fee) || 0, frequency, oneTimeMonth: frequency === "one_time" ? oneTimeMonth : null, contractStart: contractStart || null, contractEnd: contractEnd || null }
+      : { ...base, monthlyAmount: parseFloat(monthlyAmount) || 0, billingCycle, renewalDate: renewalDate || null };
+    onSave(fields);
+  };
+
+  return (
+    <div style={{ background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 10, padding: 14, marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10, alignItems: "flex-end" }}>
+        <div>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Type</div>
+          <select value={type} onChange={(e) => setType(e.target.value)} style={styles.yearSelect}>
+            <option value="rent">Rent</option>
+            <option value="consultant">Consultant</option>
+            <option value="subscription">Subscription</option>
+          </select>
+        </div>
+        <div>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>{type === "rent" ? "Office name" : type === "consultant" ? "Consultant name" : "Subscription vendor"}<RequiredStar /></div>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder={type === "rent" ? "e.g. Riyadh HQ" : type === "consultant" ? "e.g. Jane Doe" : "e.g. Salesforce"} style={{ ...styles.chatInput, background: "#FFFFFF", maxWidth: 220 }} />
+        </div>
+        <div>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Entity</div>
+          <input value={entity} onChange={(e) => setEntity(e.target.value)} placeholder="e.g. CBK" style={{ ...styles.chatInput, background: "#FFFFFF", maxWidth: 120 }} />
+        </div>
+        <div>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Category<RequiredStar /></div>
+          <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} style={styles.yearSelect}>
+            <option value="">Choose category\u2026</option>
+            {topLevelCategories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, paddingBottom: 8 }}>
+          <input type="checkbox" checked={activeFlag} onChange={(e) => setActiveFlag(e.target.checked)} /> Active
+        </label>
+      </div>
+
+      {type === "rent" && (
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <LabeledInput label="Monthly rent ($)" value={monthlyRent} onChange={setMonthlyRent} type="number" />
+          <LabeledInput label="Escalation % (applies from renewal/anniversary month)" value={escalationPct} onChange={setEscalationPct} type="number" />
+          <LabeledInput label="Lease start" value={leaseStart} onChange={setLeaseStart} type="date" />
+          <LabeledInput label="Lease end" value={leaseEnd} onChange={setLeaseEnd} type="date" />
+        </div>
+      )}
+      {type === "consultant" && (
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <LabeledInput label="Fee ($)" value={fee} onChange={setFee} type="number" />
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Frequency</div>
+            <select value={frequency} onChange={(e) => setFrequency(e.target.value)} style={styles.yearSelect}>
+              <option value="monthly">Monthly</option>
+              <option value="quarterly">Quarterly</option>
+              <option value="annual">Annual</option>
+              <option value="one_time">One-time</option>
+            </select>
+          </div>
+          <LabeledInput label="Contract start" value={contractStart} onChange={setContractStart} type="date" />
+          <LabeledInput label="Contract end" value={contractEnd} onChange={setContractEnd} type="date" />
+          {frequency === "one_time" && (
+            <div>
+              <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Which month?</div>
+              <select value={oneTimeMonth} onChange={(e) => setOneTimeMonth(parseInt(e.target.value, 10))} style={styles.yearSelect}>
+                {MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+              </select>
+            </div>
+          )}
+        </div>
+      )}
+      {type === "subscription" && (
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <LabeledInput label="Monthly amount ($)" value={monthlyAmount} onChange={setMonthlyAmount} type="number" />
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Billing cycle</div>
+            <select value={billingCycle} onChange={(e) => setBillingCycle(e.target.value)} style={styles.yearSelect}>
+              <option value="monthly">Monthly</option>
+              <option value="annual">Annual</option>
+            </select>
+          </div>
+          <LabeledInput label="Renewal date" value={renewalDate} onChange={setRenewalDate} type="date" />
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+        <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
+        <button onClick={handleSave} style={styles.primaryBtn} disabled={!name.trim() || !categoryId}>Save</button>
+      </div>
+    </div>
+  );
+}
+
+// `required` renders a red star after the label — the one consistent mark
+// for "this field blocks Save if left empty" across every form in the app
+// (RequiredStar below is the same span reused directly in forms that don't
+// go through LabeledInput, e.g. AddVendorModal's plain <label>).
+function RequiredStar() {
+  return <span style={{ color: "#C00000" }} aria-hidden="true"> *</span>;
+}
+function LabeledInput({ label, value, onChange, type, required }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>{label}{required && <RequiredStar />}</div>
+      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} style={{ ...styles.chatInput, background: "#FFFFFF", width: 140 }} />
+    </div>
+  );
+}
+
+// ---- Budget & Variance ------------------------------------------------------
+function BudgetVarianceView({ year, isEditableYear, activeBudgetingYear, budgetLines, rollup, categories, generating, onGenerate, onOverride, fmtN }) {
+  const [editingCell, setEditingCell] = useState(null); // "lineId|monthIndex"
+  const [editVal, setEditVal] = useState("");
+
+  const actualsByLineId = {};
+  for (const cat of rollup) {
+    if (cat.subcategories && cat.subcategories.length > 0) {
+      for (const sub of cat.subcategories) actualsByLineId[sub.id] = sub.monthly;
+    } else {
+      actualsByLineId[cat.id] = cat.monthly;
+    }
+  }
+
+  const lineName = (line) => categories.find(c => c.id === (line.subcategoryId || line.categoryId))?.name || line.id;
+
+  const totals = { budget: new Array(12).fill(0), actual: new Array(12).fill(0) };
+  budgetLines.forEach(line => { (line.monthlyAmount || []).forEach((v, i) => { totals.budget[i] += v || 0; }); });
+  Object.values(actualsByLineId).forEach(monthly => { monthly.forEach((v, i) => { totals.actual[i] += v || 0; }); });
+  const totalBudget = totals.budget.reduce((a, b) => a + b, 0);
+  const totalActual = totals.actual.reduce((a, b) => a + b, 0);
+
+  return (
+    <div style={styles.panel}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={styles.panelTitle}>Budget vs Actual \u2014 {year}</div>
+        {isEditableYear ? (
+          <button onClick={onGenerate} disabled={generating} style={styles.primaryBtn}>
+            {generating ? "Generating\u2026" : budgetLines.length > 0 ? "Regenerate Budget" : "Generate Budget"}
+          </button>
+        ) : (
+          <span style={{ fontSize: 11.5, color: "#8A6D1A", background: "#FFF8E1", border: "1px solid #E8C468", borderRadius: 6, padding: "3px 8px" }}>
+            Read-only \u2014 budget generation/editing is only enabled for {activeBudgetingYear}.
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
+        Budget = an active agreement's terms where one exists, else last year's actual \u00d7 growth%, shaped to last year's own monthly pattern. Click a budget figure to override it manually \u2014 the original system estimate is kept even after an override.
+      </div>
+
+      {budgetLines.length === 0 ? (
+        <div style={{ fontSize: 12, color: "#6B6B6B" }}>No budget generated yet for {year}.</div>
+      ) : (
+        <div style={styles.tableScroll}>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th rowSpan={2} style={{ ...styles.th, textAlign: "left", verticalAlign: "bottom" }}>Category</th>
+                <th colSpan={12} style={{ ...styles.th, textAlign: "center", borderBottom: "1px solid #E0E0E0" }}>Budget</th>
+                <th colSpan={12} style={{ ...styles.th, textAlign: "center", borderBottom: "1px solid #E0E0E0" }}>Actual</th>
+                <th colSpan={12} style={{ ...styles.th, textAlign: "center", borderBottom: "1px solid #E0E0E0" }}>Variance</th>
+                <th rowSpan={2} style={{ ...styles.th, fontWeight: 700 }}>Budget Total</th>
+                <th rowSpan={2} style={{ ...styles.th, fontWeight: 700 }}>Actual Total</th>
+              </tr>
+              <tr>
+                {MONTHS.map(m => <th key={`b${m}`} style={{ ...styles.th, fontSize: 10 }}>{m}</th>)}
+                {MONTHS.map(m => <th key={`a${m}`} style={{ ...styles.th, fontSize: 10 }}>{m}</th>)}
+                {MONTHS.map(m => <th key={`v${m}`} style={{ ...styles.th, fontSize: 10 }}>{m}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {budgetLines.map(line => {
+                const actual = actualsByLineId[line.id] || new Array(12).fill(0);
+                const budgetTotal = (line.monthlyAmount || []).reduce((a, b) => a + b, 0);
+                const actualTotal = actual.reduce((a, b) => a + b, 0);
+                return (
+                  <tr key={line.id} className="row-hover" style={styles.tr}>
+                    <td style={{ ...styles.td, textAlign: "left", fontWeight: 600, whiteSpace: "nowrap" }}>
+                      {lineName(line)}
+                      <span style={{ fontSize: 9.5, color: "#8A8A8A", marginLeft: 6, textTransform: "uppercase" }}>{line.source}</span>
+                    </td>
+                    {(line.monthlyAmount || new Array(12).fill(0)).map((v, i) => {
+                      const cellKey = `${line.id}|${i}`;
+                      return (
+                        <td key={i} className="num" style={{ ...styles.td, fontSize: 10.5, cursor: isEditableYear ? "pointer" : "default" }}
+                          onClick={() => { if (!isEditableYear) return; setEditingCell(cellKey); setEditVal(String(Math.round(v))); }}>
+                          {editingCell === cellKey ? (
+                            <input autoFocus className="num" value={editVal} onChange={(e) => setEditVal(e.target.value)}
+                              onBlur={() => { onOverride(line.id, i, parseFloat(editVal) || 0); setEditingCell(null); }}
+                              onKeyDown={(e) => { if (e.key === "Enter") { onOverride(line.id, i, parseFloat(editVal) || 0); setEditingCell(null); } if (e.key === "Escape") setEditingCell(null); }}
+                              style={styles.gridCellInput} />
+                          ) : fmtN(v)}
+                        </td>
+                      );
+                    })}
+                    {actual.map((v, i) => <td key={i} className="num" style={{ ...styles.td, fontSize: 10.5, color: "#6B6B6B" }}>{fmtN(v)}</td>)}
+                    {(line.monthlyAmount || new Array(12).fill(0)).map((b, i) => {
+                      const varAmt = (actual[i] || 0) - b;
+                      return <td key={i} className="num" style={{ ...styles.td, fontSize: 10.5, color: varAmt <= 0 ? "#1B8A3A" : "#C00000" }}>{varAmt >= 0 ? "+" : ""}{fmtN(varAmt)}</td>;
+                    })}
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(budgetTotal)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(actualTotal)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "2px solid #111111" }}>
+                <td style={{ ...styles.td, textAlign: "left", fontWeight: 700 }}>Total</td>
+                {totals.budget.map((v, i) => <td key={i} className="num" style={{ ...styles.td, fontWeight: 700, fontSize: 10.5 }}>{fmtN(v)}</td>)}
+                {totals.actual.map((v, i) => <td key={i} className="num" style={{ ...styles.td, fontWeight: 700, fontSize: 10.5 }}>{fmtN(v)}</td>)}
+                {totals.budget.map((b, i) => {
+                  const varAmt = (totals.actual[i] || 0) - b;
+                  return <td key={i} className="num" style={{ ...styles.td, fontWeight: 700, fontSize: 10.5, color: varAmt <= 0 ? "#1B8A3A" : "#C00000" }}>{varAmt >= 0 ? "+" : ""}{fmtN(varAmt)}</td>;
+                })}
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totalBudget)}</td>
+                <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totalActual)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Employee Cost Module (base) -------------------------------------------
+const DEPARTMENTS = ["Finance and Ops", "Marketing", "Management", "HR and Admin", "PS", "Sales", "Presales", "Delivery", "Operations", "Leadership"];
+const DEPT_COLORS = ["#E58B85", "#7FAAD9", "#7FC98F", "#EBB966", "#B69AE8", "#7FCBDB", "#E88F94", "#7FD4AC", "#D6BC7F", "#A6AFBD", "#E0A970", "#7FADCE", "#D998B0", "#8FC7C4", "#ABCB8A", "#B698D6"];
+
+// Sub-region -> flag emoji(s). Single-country sub-regions get their exact
+// flag; grouped regions (Levant, Arabic Africa, etc. — CIPR's Sub Region
+// taxonomy mixes individual Gulf countries with broader multi-country
+// groupings) get a representative cluster of a couple of flags from that
+// group, since there's no single flag that's accurate for a grouping. A
+// genuine choropleth map would need real GeoJSON boundary data per
+// sub-region, which isn't available — this is the practical fallback.
+const SUBREGION_FLAGS = {
+  "KSA": "🇸🇦", "Saudi Arabia": "🇸🇦",
+  "UAE": "🇦🇪",
+  "Qatar": "🇶🇦",
+  "Kuwait": "🇰🇼",
+  "Bahrain": "🇧🇭",
+  "Oman": "🇴🇲",
+  "Egypt": "🇪🇬",
+  "Gulf": "🇸🇦🇦🇪",
+  "Levant": "🇱🇧🇯🇴",
+  "Arabic Africa": "🇪🇬🇲🇦",
+  "French Africa": "🇸🇳🇨🇮",
+  "Sub-Saharan Africa": "🌍",
+  "Rest of the world": "🌐",
+};
+const flagFor = (name) => SUBREGION_FLAGS[name] || "🌍";
+
+function EmployeesTab({ showToast, year }) {
+  const { fmtN } = useNumberUnit();
+  const [employees, setEmployees] = useState([]);
+  const [thresholds, setThresholds] = useState(null);
+  const [vendorOptions, setVendorOptions] = useState([]);
+  const [regionOptions, setRegionOptions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [deptFilter, setDeptFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("active"); // active | resigned | all
+  const [expandedId, setExpandedId] = useState(null);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingEmployee, setEditingEmployee] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [emps, th, vendorRows] = await Promise.all([
+        getEmployees(), getBenefitThresholds(), getVendors(year),
+      ]);
+      setEmployees(emps);
+      setThresholds(th);
+      setVendorOptions(vendorRows.map(v => v.vendor).sort());
+      // Sub-regions (CIPR's "Sub Region" taxonomy — KSA/UAE/Qatar/Levant/
+      // etc.), not countries — derived from the union of every vendor's
+      // own `regions` field, the same source VendorPerformanceView's
+      // region filter already uses, rather than getRegions() which
+      // returns country-level entries (a different granularity).
+      let subRegions = [...new Set(vendorRows.flatMap(v => v.regions || []))];
+      if (subRegions.length === 0) {
+        // `regions` only populates from real actuals data — for the active
+        // budgeting year (no actuals yet), this comes back empty. Sub-
+        // region names are a stable taxonomy independent of which year is
+        // being planned, so fall back to the current calendar year (which
+        // should have real synced data) rather than showing an empty picker.
+        try {
+          const fallbackVendors = await getVendors(new Date().getFullYear());
+          subRegions = [...new Set(fallbackVendors.flatMap(v => v.regions || []))];
+        } catch (e) { /* not fatal — picker just stays empty if this also fails */ }
+      }
+      setRegionOptions(subRegions.sort());
+    } catch (e) {
+      console.error("EmployeesTab load failed:", e);
+      showToast(`Couldn't load employee data: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, [year]);
+
+  const isResignedInOrBefore = (e) => e.resignationDate && new Date(e.resignationDate) <= new Date(year, 11, 31);
+  const filtered = employees.filter(e => {
+    if (search && !e.name?.toLowerCase().includes(search.toLowerCase()) && !e.employeeNo?.toLowerCase().includes(search.toLowerCase())) return false;
+    if (deptFilter && e.department !== deptFilter) return false;
+    if (statusFilter === "active" && isResignedInOrBefore(e)) return false;
+    if (statusFilter === "resigned" && !isResignedInOrBefore(e)) return false;
+    return true;
+  });
+
+  const stats = employees.length ? computeEmployeeDashboardStats(employees, year) : null;
+
+  const handleSaveEmployee = async (fields) => {
+    try {
+      if (editingEmployee) await updateEmployee(editingEmployee.id, fields);
+      else await addEmployee(fields);
+      setFormOpen(false); setEditingEmployee(null);
+      await load();
+      showToast(editingEmployee ? "Employee updated" : "Employee added");
+    } catch (e) {
+      showToast(`Couldn't save employee: ${e.message}`);
+    }
+  };
+
+  const handleResign = async (id, name) => {
+    const dateStr = window.prompt(`Resignation date for ${name} (YYYY-MM-DD):`);
+    if (!dateStr) return;
+    try {
+      await resignEmployee(id, dateStr);
+      await load();
+      showToast(`${name} marked as resigned effective ${dateStr}`);
+    } catch (e) {
+      showToast(`Couldn't set resignation: ${e.message}`);
+    }
+  };
+
+  const handleReinstate = async (id, name) => {
+    try {
+      await reinstateEmployee(id);
+      await load();
+      showToast(`${name} reinstated`);
+    } catch (e) {
+      showToast(`Couldn't reinstate: ${e.message}`);
+    }
+  };
+
+  const handleDelete = async (id, name) => {
+    if (!window.confirm(`Permanently delete ${name}? This is for data-entry mistakes only — use "Mark as resigned" for real departures.`)) return;
+    try {
+      await deleteEmployee(id);
+      await load();
+    } catch (e) {
+      showToast(`Couldn't delete: ${e.message}`);
+    }
+  };
+
+  const handleSaveHikes = async (id, hikes) => {
+    try {
+      await setEmployeeHikes(id, year, hikes);
+      await load();
+      showToast("Hikes saved");
+    } catch (e) {
+      showToast(`Couldn't save hikes: ${e.message}`);
+    }
+  };
+
+  const departmentData = stats ? Object.entries(stats.byDepartment).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value) : [];
+  const locationData = stats ? Object.entries(stats.byLocation).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value) : [];
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>
+          Employee master for {year}. Monthly cost is calculated from Basic + HRA + Other Allowance + VP, joining/resignation dates, and any hikes entered for this year — not hand-typed per cell.
+        </div>
+        <button onClick={() => { setEditingEmployee(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Employee</button>
+      </div>
+
+      {stats && (
+        <div style={styles.kpiGrid}>
+          <KpiCard label="Active Employees" value={String(stats.totalActive)} sub={`${year}`} />
+          <KpiCard label="New Hires (by quarter)" value={stats.newHiresByQuarter.join(" / ")} sub="Q1 / Q2 / Q3 / Q4" />
+          <KpiCard label="Resigned This Year" value={String(stats.resignedThisYear)} />
+          <KpiCard label="Total Annual Cost" value={fmtN(stats.totalAnnualCost)} />
+        </div>
+      )}
+
+      {departmentData.length > 0 && (
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Headcount by Department</div>
+          <ResponsiveContainer width="100%" height={Math.max(180, departmentData.length * 32)}>
+            <BarChart data={departmentData} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis type="number" allowDecimals={false} fontSize={12} stroke="#6B6B6B" />
+              <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={140} />
+              <Tooltip contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+              <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                {departmentData.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+                <LabelList dataKey="value" position="right" fontSize={12} fill="#111111" />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {locationData.length > 0 && (
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Headcount by Location</div>
+          <ResponsiveContainer width="100%" height={Math.max(180, locationData.length * 32)}>
+            <BarChart data={locationData} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis type="number" allowDecimals={false} fontSize={12} stroke="#6B6B6B" />
+              <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={140} />
+              <Tooltip contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+              <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                {locationData.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+                <LabelList dataKey="value" position="right" fontSize={12} fill="#111111" />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {formOpen && (
+        <EmployeeFormModal
+          initial={editingEmployee}
+          vendorOptions={vendorOptions} regionOptions={regionOptions}
+          onCancel={() => { setFormOpen(false); setEditingEmployee(null); }}
+          onSave={handleSaveEmployee}
+        />
+      )}
+
+      <div style={styles.panel}>
+        <div style={styles.tableToolbar}>
+          <div style={styles.searchBox}><Search size={14} color="#6B6B6B" /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name or employee no…" style={styles.searchInput} /></div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} style={styles.yearSelect}>
+              <option value="">All departments</option>
+              {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={styles.yearSelect}>
+              <option value="active">Active</option>
+              <option value="resigned">Resigned</option>
+              <option value="all">All</option>
+            </select>
+          </div>
+        </div>
+
+        {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : filtered.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#6B6B6B" }}>No employees match this filter.</div>
+        ) : (
+          <div style={styles.tableScroll}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={{ ...styles.th, textAlign: "left" }}>Name</th>
+                  {MONTHS.map(m => <th key={m} style={{ ...styles.th, fontSize: 10 }}>{m}</th>)}
+                  <th style={{ ...styles.th, fontWeight: 700 }}>Total</th>
+                  <th style={styles.th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(e => (
+                  <EmployeeRow
+                    key={e.id} employee={e} year={year} thresholds={thresholds}
+                    expanded={expandedId === e.id} onToggleExpand={() => setExpandedId(expandedId === e.id ? null : e.id)}
+                    onEdit={() => { setEditingEmployee(e); setFormOpen(true); }}
+                    onResign={() => handleResign(e.id, e.name)} onReinstate={() => handleReinstate(e.id, e.name)}
+                    onDelete={() => handleDelete(e.id, e.name)} onSaveHikes={(hikes) => handleSaveHikes(e.id, hikes)}
+                    fmtN={fmtN}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EmployeeRow({ employee, year, thresholds, expanded, onToggleExpand, onEdit, onResign, onReinstate, onDelete, onSaveHikes, fmtN }) {
+  const monthly = computeEmployeeMonthlyCost(employee, year);
+  const total = monthly.reduce((a, b) => a + b, 0);
+  const isResigned = !!employee.resignationDate;
+  return (
+    <>
+      <tr className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={onToggleExpand}>
+        <td style={{ ...styles.td, textAlign: "left", fontWeight: 600, whiteSpace: "nowrap" }}>
+          {expanded ? <ChevronDown size={12} style={{ marginRight: 5, verticalAlign: -1 }} /> : <ChevronRight size={12} style={{ marginRight: 5, verticalAlign: -1 }} />}
+          {employee.name}
+          {isResigned && <span style={{ fontSize: 10, color: "#C00000", marginLeft: 6 }}>(resigned)</span>}
+        </td>
+        {monthly.map((v, i) => <td key={i} className="num" style={{ ...styles.td, fontSize: 10.5 }}>{v ? fmtN(v) : "—"}</td>)}
+        <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(total)}</td>
+        <td style={{ ...styles.td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+          <button onClick={onEdit} style={{ ...styles.iconBtnGhost, width: 22, height: 22 }} title="Edit"><Sliders size={11} /></button>
+          {isResigned ? (
+            <button onClick={onReinstate} style={{ ...styles.iconBtnGhost, width: 22, height: 22, marginLeft: 4 }} title="Reinstate"><RotateCcw size={11} /></button>
+          ) : (
+            <button onClick={onResign} style={{ ...styles.iconBtnGhost, width: 22, height: 22, marginLeft: 4 }} title="Mark as resigned"><Clock size={11} /></button>
+          )}
+          <button onClick={onDelete} style={{ ...styles.iconBtnGhost, width: 22, height: 22, marginLeft: 4 }} title="Delete"><X size={11} /></button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={14} style={{ padding: 0, border: "none" }}>
+            <EmployeeDetail employee={employee} year={year} thresholds={thresholds} onSaveHikes={onSaveHikes} fmtN={fmtN} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function formatAllocation(value, kindLabel) {
+  if (!value) return "—";
+  if (typeof value === "string") return value; // pre-multiselect legacy data
+  if (value.mode === "all") return `Allocated to all ${kindLabel}`;
+  if (value.list && value.list.length) return value.list.join(", ");
+  return "—";
+}
+
+function EmployeeDetail({ employee, year, thresholds, onSaveHikes, fmtN }) {
+  const [hikes, setHikes] = useState((employee.hikes && employee.hikes[year]) || []);
+  const eligibility = thresholds ? computeBenefitEligibility(employee, year, thresholds) : null;
+
+  const addHike = () => setHikes(prev => [...prev, { effectiveMonth: 1, pct: 0 }]);
+  const updateHike = (i, field, val) => setHikes(prev => prev.map((h, idx) => idx === i ? { ...h, [field]: val } : h));
+  const removeHike = (i) => setHikes(prev => prev.filter((_, idx) => idx !== i));
+
+  return (
+    <div style={{ background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 10, padding: 14, margin: "6px 0" }}>
+      <div style={{ display: "flex", gap: 30, flexWrap: "wrap", marginBottom: 14, fontSize: 12.5 }}>
+        <div><span style={{ color: "#6B6B6B" }}>Employee No: </span><strong>{employee.employeeNo || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>Designation: </span><strong>{employee.designation || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>Department: </span><strong>{employee.department || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>Entity: </span><strong>{employee.entity || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>Country: </span><strong>{employee.country || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>Joining: </span><strong>{employee.joiningDate || "—"}</strong></div>
+        {employee.resignationDate && <div><span style={{ color: "#6B6B6B" }}>Resigned: </span><strong>{employee.resignationDate}</strong></div>}
+      </div>
+      <div style={{ fontSize: 12.5, marginBottom: 14 }}>
+        <div><span style={{ color: "#6B6B6B" }}>Vendor allocation: </span>{formatAllocation(employee.vendorAllocation, "vendors")}</div>
+        <div><span style={{ color: "#6B6B6B" }}>Sub-Region allocation: </span>{formatAllocation(employee.regionAllocation, "sub-regions")}</div>
+      </div>
+
+      {eligibility && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "#6B6B6B", marginBottom: 6 }}>BENEFIT ELIGIBILITY</div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {Object.entries(eligibility).map(([benefit, e]) => (
+              <span key={benefit} style={{
+                fontSize: 11, padding: "3px 9px", borderRadius: 6, textTransform: "capitalize",
+                background: e.status === "eligible" ? "#E8F5E9" : e.status === "eligible_from" ? "#FFF8E1" : "#F0F0F0",
+                color: e.status === "eligible" ? "#1B8A3A" : e.status === "eligible_from" ? "#8A6D1A" : "#8A8A8A",
+              }}>
+                {benefit}: {e.status === "eligible" ? "Eligible" : e.status === "eligible_from" ? `Eligible from ${MONTHS[e.fromMonth - 1]}` : "Not eligible this FY"}
+                {e.overridden && " (override)"}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 600, color: "#6B6B6B", marginBottom: 6 }}>HIKES — {year}</div>
+        {hikes.map((h, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }}>
+            <span style={{ fontSize: 11.5 }}>Effective month</span>
+            <select value={h.effectiveMonth} onChange={(e) => updateHike(i, "effectiveMonth", parseInt(e.target.value, 10))} style={{ ...styles.yearSelect, fontSize: 11.5, padding: "3px 8px" }}>
+              {MONTHS.map((m, mi) => <option key={m} value={mi + 1}>{m}</option>)}
+            </select>
+            <input type="number" value={h.pct} onChange={(e) => updateHike(i, "pct", parseFloat(e.target.value) || 0)} style={{ ...styles.gridCellInput, position: "static", width: 60 }} />
+            <span style={{ fontSize: 11.5 }}>%</span>
+            <button onClick={() => removeHike(i)} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }}><X size={10} /></button>
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <button onClick={addHike} style={styles.secondaryBtn}>+ Add Hike</button>
+          <button onClick={() => onSaveHikes(hikes)} style={styles.primaryBtn}>Save Hikes</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const EMPLOYEE_COUNTRIES = ["Dubai", "Saudi", "India", "Qatar", "Kuwait", "Bahrain", "Levant", "Oman", "Egypt", "South Africa", "North Africa"];
+
+// Normalizes old data: vendorAllocation/regionAllocation used to be a free
+// text string (spec's own stated fallback) before this became a proper
+// multi-select. A string value is treated as unset rather than trying to
+// parse it — the old text isn't lost (still on the record under this same
+// field until saved over), just not pre-selected in the new picker.
+function normalizeAllocation(value) {
+  if (value && typeof value === "object" && (value.mode === "all" || value.mode === "list")) return value;
+  return { mode: "all", list: [] };
+}
+
+// Multi-select with an "allocate to all" option, mutually exclusive with
+// picking individual items — checking "all" clears any specific selection,
+// and checking a specific item while "all" was active switches to list mode
+// starting with just that item.
+function AllocationMultiSelect({ label, options, value, onChange, allLabel }) {
+  const mode = value?.mode || "all";
+  const list = value?.list || [];
+
+  const toggleAll = () => onChange({ mode: "all", list: [] });
+  const toggleItem = (item) => {
+    if (mode === "all") { onChange({ mode: "list", list: [item] }); return; }
+    const has = list.includes(item);
+    const newList = has ? list.filter(x => x !== item) : [...list, item];
+    onChange(newList.length ? { mode: "list", list: newList } : { mode: "all", list: [] });
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>{label}</div>
+      <div style={{ width: 240, maxHeight: 160, overflowY: "auto", border: "1px solid #E0E0E0", borderRadius: 7, padding: 8, background: "#FFFFFF" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, marginBottom: 6, paddingBottom: 6, borderBottom: "1px solid #F0F0F0" }}>
+          <input type="checkbox" checked={mode === "all"} onChange={toggleAll} /> {allLabel}
+        </label>
+        {(!options || options.length === 0) ? (
+          <div style={{ fontSize: 11, color: "#8A8A8A" }}>No options loaded for this year yet.</div>
+        ) : options.map(opt => (
+          <label key={opt} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, padding: "2px 0" }}>
+            <input type="checkbox" checked={mode === "list" && list.includes(opt)} onChange={() => toggleItem(opt)} /> {opt}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EmployeeFormModal({ initial, vendorOptions, regionOptions, onCancel, onSave }) {
+  const [employeeNo, setEmployeeNo] = useState(initial?.employeeNo || "");
+  const [name, setName] = useState(initial?.name || "");
+  const [designation, setDesignation] = useState(initial?.designation || "");
+  const [department, setDepartment] = useState(initial?.department || "");
+  const [entity, setEntity] = useState(initial?.entity || "");
+  const [country, setCountry] = useState(initial?.country || "");
+  const [vendorAllocation, setVendorAllocation] = useState(normalizeAllocation(initial?.vendorAllocation));
+  const [regionAllocation, setRegionAllocation] = useState(normalizeAllocation(initial?.regionAllocation));
+  const [joiningDate, setJoiningDate] = useState(initial?.joiningDate || "");
+  const [basic, setBasic] = useState(initial?.basic ?? "");
+  const [hra, setHra] = useState(initial?.hra ?? "");
+  const [otherAllowance, setOtherAllowance] = useState(initial?.otherAllowance ?? "");
+  const [vp, setVp] = useState(initial?.vp ?? "");
+  // Save used to just silently no-op (a disabled button, no explanation)
+  // when Name/Joining date were missing — from the user's side that reads
+  // as "I clicked Save and nothing happened." Now the button is always
+  // clickable; a missing required field shows an actual message instead of
+  // pretending the click didn't register. `saving` also covers the case
+  // where the click DID work but the Firestore write just takes a moment —
+  // without it there's no feedback during that gap either.
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (!name.trim() || !joiningDate) {
+      setError(!name.trim() && !joiningDate ? "Name and Joining date are required." : !name.trim() ? "Name is required." : "Joining date is required.");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    try {
+      await onSave({
+        employeeNo: employeeNo.trim() || null, name: name.trim(), designation: designation.trim() || null,
+        department: department || null, entity: entity.trim() || null, country: country || null,
+        vendorAllocation, regionAllocation, joiningDate,
+        basic: parseFloat(basic) || 0, hra: parseFloat(hra) || 0, otherAllowance: parseFloat(otherAllowance) || 0, vp: parseFloat(vp) || 0,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={styles.modalOverlay} onClick={onCancel}>
+      <div style={{ ...styles.modalCard, width: "85vw", maxWidth: 1000 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>{initial ? "Edit Employee" : "Add Employee"}</div>
+          <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+          <LabeledInput label="Employee No." value={employeeNo} onChange={setEmployeeNo} type="text" />
+          <LabeledInput label="Name" required value={name} onChange={setName} type="text" />
+          <LabeledInput label="Designation" value={designation} onChange={setDesignation} type="text" />
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Department</div>
+            <select value={department} onChange={(e) => setDepartment(e.target.value)} style={styles.yearSelect}>
+              <option value="">—</option>
+              {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <LabeledInput label="Entity" value={entity} onChange={setEntity} type="text" />
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Country</div>
+            <select value={country} onChange={(e) => setCountry(e.target.value)} style={styles.yearSelect}>
+              <option value="">—</option>
+              {EMPLOYEE_COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <LabeledInput label="Joining date" required value={joiningDate} onChange={setJoiningDate} type="date" />
+        </div>
+
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 14 }}>
+          <AllocationMultiSelect label="Vendor allocation" options={vendorOptions} value={vendorAllocation} onChange={setVendorAllocation} allLabel="Allocate to all vendors" />
+          <AllocationMultiSelect label="Sub-Region allocation" options={regionOptions} value={regionAllocation} onChange={setRegionAllocation} allLabel="Allocate to all sub-regions" />
+        </div>
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <LabeledInput label="Basic ($/mo)" value={basic} onChange={setBasic} type="number" />
+          <LabeledInput label="HRA ($/mo)" value={hra} onChange={setHra} type="number" />
+          <LabeledInput label="Other Allowance ($/mo)" value={otherAllowance} onChange={setOtherAllowance} type="number" />
+          <LabeledInput label="VP ($/mo)" value={vp} onChange={setVp} type="number" />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 18, justifyContent: "flex-end" }}>
+          {error && <div style={{ fontSize: 12, color: "#C00000", marginRight: "auto" }}>{error}</div>}
+          <button onClick={onCancel} style={styles.secondaryBtn} disabled={saving}>Cancel</button>
+          <button onClick={handleSave} style={styles.primaryBtn} disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Vendor Management Performance View (historical/in-progress years) ----
+// Only rendered for non-editable years — the active budgeting year keeps
+// the original simple VendorsTab completely untouched, per the explicit
+// requirement to keep budget entry uncluttered.
+const QUICK_FILTERS = [
+  ["all", "All"],
+  ["needs_attention", "Needs Attention"],
+  ["margin_risk", "Margin Risk"],
+  ["on_track", "On Track"],
+  ["ahead", "Ahead"],
+];
+const SORT_OPTIONS = [
+  ["budget_revenue", "Budget Revenue"],
+  ["ytdVarAmt", "Revenue Variance"],
+  ["ytdAchievementPct", "Revenue Achievement %"],
+  ["ytdGpVarAmt", "GP Variance"],
+  ["actualGpPct", "GP%"],
+  ["forecastVarAmt", "Forecast Variance"],
+  ["forecastAchievementPct", "Forecast Achievement %"],
+];
+
+function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }) {
+  const { fmtN } = useNumberUnit();
+  const completed = isYearCompleted(year);
+  const yearClass = classifyYear(year, activeBudgetingYear);
+  // Budgeting/future years have no actuals yet — nothing to show YTD,
+  // variance, forecast, or status against. Only "current_year" (this
+  // calendar year, in progress) gets the full performance-tracking format;
+  // once a budgeting/future year rolls forward into being the current
+  // year, it naturally starts showing this fuller format automatically,
+  // since yearClass is derived from the real system date each render.
+  const isBudgetingOrFuture = yearClass === "current_budgeting_year" || yearClass === "future_budgeting_year";
+  const cutoffIdx = getActualCutoffMonthIndex(year);
+
+  const [buHeadFilter, setBuHeadFilter] = useState("");
+  const [regionFilter, setRegionFilter] = useState("");
+  const [vendorSearch, setVendorSearch] = useState("");
+  const [quickFilter, setQuickFilter] = useState("all");
+  const [metricView, setMetricView] = useState("revenue"); // "revenue" | "gp"
+  const [sortKey, setSortKey] = useState("budget_revenue");
+  const [sortDir, setSortDir] = useState("desc"); // desc = highest budget revenue first, per updated default
+  const [drilldownVendor, setDrilldownVendor] = useState(null);
+  const [managementForecasts, setManagementForecasts] = useState({});
+  const [formulasOpen, setFormulasOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getManagementForecasts(year).then(mf => { if (!cancelled) setManagementForecasts(mf); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [year]);
+
+  const enriched = useMemo(() => {
+    return vendors.map(v => {
+      const { fyForecastRevenue, fyForecastGp } = computeFySystemForecast(v, year);
+      const status = computeVendorStatus(v);
+      const ytdVarAmt = v.actual_revenue_ytd - v.ytd_budget_revenue;
+      const ytdVarPct = v.ytd_budget_revenue ? ytdVarAmt / v.ytd_budget_revenue : (v.actual_revenue_ytd > 0 ? 1 : 0);
+      const ytdAchievementPct = ytdVarPct + 1;
+      const ytdGpVarAmt = v.actual_gp_ytd - v.ytd_budget_gp;
+      const ytdGpVarPct = v.ytd_budget_gp ? ytdGpVarAmt / v.ytd_budget_gp : 0;
+      const forecastVarAmt = fyForecastRevenue - v.budget_revenue;
+      const forecastVarPct = v.budget_revenue ? forecastVarAmt / v.budget_revenue : 0;
+      const forecastAchievementPct = v.budget_revenue ? fyForecastRevenue / v.budget_revenue : 0;
+      const forecastGpVarAmt = fyForecastGp - v.budget_gp;
+      const forecastGpVarPct = v.budget_gp ? forecastGpVarAmt / v.budget_gp : 0;
+      const fyVarAmt = v.actual_revenue_ytd - v.budget_revenue; // completed-year variance: FY actual vs FY budget
+      const fyVarPct = v.budget_revenue ? fyVarAmt / v.budget_revenue : 0;
+      const fyGpVarAmt = v.actual_gp_ytd - v.budget_gp;
+      const fyGpVarPct = v.budget_gp ? fyGpVarAmt / v.budget_gp : 0;
+      const actualGpPct = v.actual_revenue_ytd ? v.actual_gp_ytd / v.actual_revenue_ytd : 0;
+      const budgetGpPct = v.budget_revenue ? v.budget_gp / v.budget_revenue : 0;
+      const mgmtForecast = managementForecasts[v.vendor]?.revenue;
+      return {
+        ...v, fyForecastRevenue, fyForecastGp, status,
+        ytdVarAmt, ytdVarPct, ytdAchievementPct, ytdGpVarAmt, ytdGpVarPct,
+        forecastVarAmt, forecastVarPct, forecastAchievementPct, forecastGpVarAmt, forecastGpVarPct,
+        fyVarAmt, fyVarPct, fyGpVarAmt, fyGpVarPct,
+        actualGpPct, budgetGpPct, mgmtForecast,
+      };
+    });
+  }, [vendors, year, managementForecasts]);
+
+  const buHeadOptions = useMemo(() => [...new Set(enriched.map(v => v.bu_head).filter(Boolean))].sort(), [enriched]);
+  const regionOptions = useMemo(() => [...new Set(enriched.flatMap(v => v.regions || []))].sort(), [enriched]);
+
+  const belowPlanCount = enriched.filter(v => v.ytdVarAmt < 0).length;
+  const atRiskCount = enriched.filter(v => v.status === "margin_risk").length;
+  const gpBelowBudgetCount = enriched.filter(v => v.actualGpPct < v.budgetGpPct - 0.01).length;
+  const aheadCount = enriched.filter(v => v.ytdVarPct > 0.15).length;
+
+  const filtered = useMemo(() => {
+    let rows = enriched;
+    if (buHeadFilter) rows = rows.filter(v => v.bu_head === buHeadFilter);
+    if (regionFilter) rows = rows.filter(v => (v.regions || []).includes(regionFilter));
+    if (vendorSearch) rows = rows.filter(v => v.vendor.toLowerCase().includes(vendorSearch.toLowerCase()));
+    if (quickFilter === "needs_attention") rows = rows.filter(v => v.status === "needs_attention");
+    else if (quickFilter === "margin_risk") rows = rows.filter(v => v.status === "margin_risk");
+    else if (quickFilter === "on_track") rows = rows.filter(v => v.status === "on_track");
+    else if (quickFilter === "ahead") rows = rows.filter(v => v.ytdVarPct > 0.15);
+    return [...rows].sort((a, b) => {
+      const dir = sortDir === "asc" ? 1 : -1;
+      return ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir;
+    });
+  }, [enriched, buHeadFilter, regionFilter, vendorSearch, quickFilter, sortKey, sortDir]);
+
+  const handleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir("desc"); }
+  };
+
+  const handleSetForecast = async (vendorName, value) => {
+    try {
+      await setManagementForecast(year, vendorName, value, auth.currentUser?.email || "unknown");
+      setManagementForecasts(prev => ({ ...prev, [vendorName]: { revenue: value } }));
+    } catch (e) {
+      showToast(`Couldn't save management forecast: ${e.message}`);
+    }
+  };
+
+  const varKey = metricView === "gp" ? "ytdGpVarAmt" : "ytdVarAmt";
+  const varPctKey = metricView === "gp" ? "ytdGpVarPct" : "ytdVarPct";
+  const fyVarKey = metricView === "gp" ? "fyGpVarAmt" : "fyVarAmt";
+  const fyVarPctKey = metricView === "gp" ? "fyGpVarPct" : "fyVarPct";
+  const forecastVarKey = metricView === "gp" ? "forecastGpVarAmt" : "forecastVarAmt";
+  const forecastVarPctKey = metricView === "gp" ? "forecastGpVarPct" : "forecastVarPct";
+  const budgetKey = metricView === "gp" ? "budget_gp" : "budget_revenue";
+  const ytdBudgetKey = metricView === "gp" ? "ytd_budget_gp" : "ytd_budget_revenue";
+  const actualKey = metricView === "gp" ? "actual_gp_ytd" : "actual_revenue_ytd";
+  const fyForecastKey = metricView === "gp" ? "fyForecastGp" : "fyForecastRevenue";
+
+  // Totals row — sums the currently filtered/searched vendor list, same
+  // convention as VendorsTab's totals (budgeting-year table). Var/Var% are
+  // derived from the summed budget & actual (not an average of each row's
+  // own %), so the total's percentage is the correct weighted figure, not
+  // a naive average across vendors of very different sizes.
+  const totals = useMemo(() => {
+    const sum = (key) => filtered.reduce((s, v) => s + (v[key] || 0), 0);
+    const budget = sum(budgetKey), ytdBudget = sum(ytdBudgetKey), actual = sum(actualKey);
+    const fyForecast = sum(fyForecastKey), mgmtForecast = sum("mgmtForecast");
+    const varBase = completed ? budget : ytdBudget;
+    const varTotal = actual - varBase;
+    const forecastVarTotal = fyForecast - budget;
+    return {
+      budget, ytdBudget, actual, fyForecast, mgmtForecast, varTotal,
+      varPct: varBase ? varTotal / varBase : 0,
+      forecastVarTotal, forecastVarPct: budget ? forecastVarTotal / budget : 0,
+      // "Balance to Do" — FY Budget minus Actual (YTD Actual for the
+      // in-progress current year, FY Actual for completed years) — how much
+      // budget is left unachieved. Not shown for budgeting/future years,
+      // which have no actuals at all yet.
+      balanceToDo: budget - actual,
+    };
+  }, [filtered, budgetKey, ytdBudgetKey, actualKey, fyForecastKey, completed]);
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
+          {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
+            : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
+            : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setFormulasOpen(true)} style={{ ...styles.secondaryBtn, fontSize: 12 }} title="How these numbers are calculated">
+            ƒ Formulas
+          </button>
+          <div style={styles.unitToggle}>
+            {[["revenue", "Revenue"], ["gp", "GP"]].map(([val, label]) => (
+              <button key={val} onClick={() => setMetricView(val)} style={{ ...styles.unitToggleBtn, ...(metricView === val ? styles.unitToggleBtnActive : {}) }}>{label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {formulasOpen && <FormulasModal onClose={() => setFormulasOpen(false)} />}
+
+      {/* Management Attention summary — status-driven, so only shown for
+          "current_year" (in-progress, has real actuals to judge pace
+          against). Completed years have nothing left to track; budgeting/
+          future years have no actuals yet to compute status from at all. */}
+      {!completed && !isBudgetingOrFuture && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+          <AttentionCard label="Below Plan" value={belowPlanCount} color="#C00000" onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
+          <AttentionCard label="At Risk" value={atRiskCount} color="#7A3F9A" onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
+          <AttentionCard label="GP% Below Budget" value={gpBelowBudgetCount} color="#8A6D1A" onClick={() => setMetricView("gp")} active={metricView === "gp"} />
+          <AttentionCard label="Significantly Ahead" value={aheadCount} color="#1B8A3A" onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14, alignItems: "center" }}>
+        <div style={styles.searchBox}><Search size={14} color="#6B6B6B" /><input value={vendorSearch} onChange={(e) => setVendorSearch(e.target.value)} placeholder="Search vendor…" style={styles.searchInput} /></div>
+        <select value={buHeadFilter} onChange={(e) => setBuHeadFilter(e.target.value)} style={styles.yearSelect}>
+          <option value="">All BU Heads</option>
+          {buHeadOptions.map(b => <option key={b} value={b}>{b}</option>)}
+        </select>
+        <select value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)} style={styles.yearSelect}>
+          <option value="">All Regions</option>
+          {regionOptions.map(r => <option key={r} value={r}>{r}</option>)}
+        </select>
+        {!completed && !isBudgetingOrFuture && (
+          <div style={styles.plViewToggle}>
+            {QUICK_FILTERS.map(([k, label]) => (
+              <button key={k} onClick={() => setQuickFilter(k)} style={{ ...styles.plToggleBtn, ...(quickFilter === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+            ))}
+          </div>
+        )}
+        <select value={sortKey} onChange={(e) => setSortKey(e.target.value)} style={styles.yearSelect}>
+          {(isBudgetingOrFuture ? [["budget_revenue", "Budget Revenue"], ["budget_gp", "Budget GP"]]
+            : completed ? SORT_OPTIONS.filter(([k]) => !k.startsWith("forecast") && k !== "ytdVarAmt" && k !== "ytdAchievementPct" && k !== "ytdGpVarAmt")
+            : SORT_OPTIONS).map(([k, label]) => <option key={k} value={k}>Sort: {label}</option>)}
+        </select>
+        <button onClick={() => setSortDir(d => d === "asc" ? "desc" : "asc")} style={styles.iconBtnGhost} title="Reverse sort direction">
+          <ChevronDown size={14} style={{ transform: sortDir === "asc" ? "none" : "rotate(180deg)" }} />
+        </button>
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.tableScroll}>
+          <table style={styles.table}>
+            {isBudgetingOrFuture ? (
+              <>
+                <thead>
+                  <tr>
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>Vendor</th>
+                    <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(v => (
+                    <tr key={v.vendor} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownVendor(v)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{v.vendor}</td>
+                      <td className="num" style={styles.td}>{fmtN(v[budgetKey])}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #111111" }}>
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
+                  </tr>
+                </tfoot>
+              </>
+            ) : (
+              <>
+                <thead>
+                  <tr>
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>Vendor</th>
+                    {!completed && <th style={{ ...styles.th, textAlign: "left" }}>Status</th>}
+                    <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    {!completed && <SortableTh label="YTD Budget" sortKeyName={ytdBudgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    <SortableTh label={completed ? "FY Actual" : "YTD Actual"} sortKeyName={actualKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    <th style={{ ...styles.th, textAlign: "right" }} title="FY Budget minus Actual — how much budget remains unachieved">Balance to Do</th>
+                    <SortableTh label={completed ? "FY Var" : "YTD Var"} sortKeyName={completed ? fyVarKey : varKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    <SortableTh label={completed ? "FY Var %" : "YTD Var %"} sortKeyName={completed ? fyVarPctKey : varPctKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    {!completed && <SortableTh label="FY Forecast (System)" sortKeyName={fyForecastKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    {!completed && <SortableTh label="Mgmt Forecast" sortKeyName="mgmtForecast" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    {!completed && <SortableTh label="Forecast Var" sortKeyName={forecastVarKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    {!completed && <SortableTh label="Forecast Var %" sortKeyName={forecastVarPctKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(v => (
+                    <tr key={v.vendor} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownVendor(v)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{v.vendor}</td>
+                      {!completed && (
+                        <td style={{ ...styles.td, textAlign: "left" }}>
+                          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 5, color: "#FFFFFF", background: STATUS_COLORS[v.status] }}>{STATUS_LABELS[v.status]}</span>
+                        </td>
+                      )}
+                      <td className="num" style={styles.td}>{fmtN(v[budgetKey])}</td>
+                      {!completed && <td className="num" style={styles.td}>{fmtN(v[ytdBudgetKey])}</td>}
+                      <td className="num" style={styles.td}>{fmtN(v[actualKey])}</td>
+                      <td className="num" style={styles.td}>{fmtN(v[budgetKey] - v[actualKey])}</td>
+                      <td className="num" style={{ ...styles.td, color: v[completed ? fyVarKey : varKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{v[completed ? fyVarKey : varKey] >= 0 ? "+" : ""}{fmtN(v[completed ? fyVarKey : varKey])}</td>
+                      <td className="num" style={{ ...styles.td, color: v[completed ? fyVarPctKey : varPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(v[completed ? fyVarPctKey : varPctKey])}</td>
+                      {!completed && <td className="num" style={styles.td}>{fmtN(v[fyForecastKey])}</td>}
+                      {!completed && (
+                        <td className="num" style={styles.td} onClick={(e) => e.stopPropagation()}>
+                          <ManagementForecastCell vendor={v.vendor} value={v.mgmtForecast} onSave={handleSetForecast} fmtN={fmtN} />
+                        </td>
+                      )}
+                      {!completed && <td className="num" style={{ ...styles.td, color: v[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{v[forecastVarKey] >= 0 ? "+" : ""}{fmtN(v[forecastVarKey])}</td>}
+                      {!completed && <td className="num" style={{ ...styles.td, color: v[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(v[forecastVarPctKey])}</td>}
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #111111" }}>
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                    {!completed && <td style={styles.td}></td>}
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.ytdBudget)}</td>}
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.actual)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.balanceToDo)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varTotal >= 0 ? "#1B8A3A" : "#C00000" }}>{totals.varTotal >= 0 ? "+" : ""}{fmtN(totals.varTotal)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varPct >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(totals.varPct)}</td>
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.fyForecast)}</td>}
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.mgmtForecast)}</td>}
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.forecastVarTotal >= 0 ? "#1B8A3A" : "#C00000" }}>{totals.forecastVarTotal >= 0 ? "+" : ""}{fmtN(totals.forecastVarTotal)}</td>}
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.forecastVarPct >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(totals.forecastVarPct)}</td>}
+                  </tr>
+                </tfoot>
+              </>
+            )}
+          </table>
+        </div>
+      </div>
+
+      {drilldownVendor && (
+        <VendorDrilldownModal vendor={drilldownVendor} year={year} completed={completed} isBudgetingOrFuture={isBudgetingOrFuture} onClose={() => setDrilldownVendor(null)} fmtN={fmtN} />
+      )}
+    </div>
+  );
+}
+
+// Clickable column header with a sort-direction arrow — click once to sort
+// by this column (defaults to descending), click again to flip direction.
+// Shared by VendorPerformanceView and RegionPerformanceView.
+function SortableTh({ label, sortKeyName, sortKey, sortDir, onSort }) {
+  const active = sortKey === sortKeyName;
+  return (
+    <th style={{ ...styles.th, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }} onClick={() => onSort(sortKeyName)} title={`Sort by ${label}`}>
+      {label} <span style={{ color: active ? "#111111" : "#C0C0C0", fontSize: 9 }}>{active ? (sortDir === "asc" ? "▲" : "▼") : "▲▼"}</span>
+    </th>
+  );
+}
+
+function AttentionCard({ label, value, color, onClick, active }) {
+  return (
+    <button onClick={onClick} style={{ ...styles.panel, textAlign: "left", cursor: "pointer", border: active ? `2px solid ${color}` : styles.panel.border, padding: 14 }}>
+      <div style={{ fontSize: 11, color: "#6B6B6B", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 700, color }}>{value}</div>
+    </button>
+  );
+}
+
+function ManagementForecastCell({ vendor, value, onSave, fmtN }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value != null ? String(Math.round(value)) : "");
+  if (!editing) {
+    return (
+      <span onClick={() => { setVal(value != null ? String(Math.round(value)) : ""); setEditing(true); }} style={{ cursor: "pointer", borderBottom: "1px dashed #C0C0C0" }} title="Click to set a management forecast">
+        {value != null ? fmtN(value) : "— set —"}
+      </span>
+    );
+  }
+  return (
+    <input
+      autoFocus className="num" value={val} onChange={(e) => setVal(e.target.value)}
+      onBlur={() => { setEditing(false); const n = parseFloat(val); if (!isNaN(n)) onSave(vendor, n); }}
+      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setEditing(false); }}
+      style={{ ...styles.gridCellInput, position: "static", width: 90 }}
+    />
+  );
+}
+
+function FormulasModal({ onClose }) {
+  const Row = ({ label, formula, note }) => (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 3 }}>{label}</div>
+      <div className="num" style={{ fontSize: 12.5, background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 6, padding: "6px 10px", marginBottom: note ? 4 : 0 }}>{formula}</div>
+      {note && <div style={{ fontSize: 11.5, color: "#6B6B6B" }}>{note}</div>}
+    </div>
+  );
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modalCard, width: "90vw", maxWidth: 1000, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 17, marginBottom: 4 }}>Formulas</div>
+            <div style={{ fontSize: 12, color: "#6B6B6B", marginBottom: 18 }}>How every number in this view is calculated.</div>
+          </div>
+          <button onClick={onClose} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 32px" }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 10 }}>Variance</div>
+            <Row label="YTD Variance" formula="Actual Revenue (YTD) − YTD Budget" note="YTD Budget is the sum of only the months elapsed so far from the vendor's monthly budget phasing — not the full annual budget divided by 12, and not the full annual budget itself. This keeps the comparison apples-to-apples by time period." />
+            <Row label="YTD Variance %" formula="YTD Variance ÷ YTD Budget" />
+            <Row label="FY Variance (completed years only)" formula="FY Actual − FY Budget" note="Once a year is fully complete, there's no more YTD/forecast distinction — it's simply actual vs. the full annual budget." />
+
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em", margin: "18px 0 10px" }}>FY System Forecast</div>
+            <Row
+              label="FY System Forecast"
+              formula="YTD Actual + (Remaining Months' Budget × YTD Run-Rate Ratio)"
+              note="YTD Run-Rate Ratio = YTD Actual ÷ YTD Budget. The remaining months use the vendor's own budget phasing for their shape (so a back-loaded budget still gets a back-loaded forecast), scaled by how the vendor has actually been performing so far this year. If YTD Budget is 0, the ratio defaults to 1 (forecast the remaining months at their budgeted value)."
+            />
+            <Row label="Forecast Variance" formula="FY System Forecast − FY Budget" />
+            <Row label="Forecast Achievement %" formula="FY System Forecast ÷ FY Budget" />
+            <Row label="Management Forecast" formula="Manually entered — no formula" note="An editable override alongside the System Forecast, for management's own judgment. Doesn't affect the System Forecast calculation." />
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 10 }}>Status</div>
+            <div style={{ fontSize: 12.5, marginBottom: 10 }}>Considers both revenue pace and margin health — a vendor can hit its revenue number on razor-thin GP% and still be flagged.</div>
+            <Row label="Margin Risk" formula="Actual GP% is 3+ percentage points below Budget GP%" note="Checked first — takes priority over revenue pace, regardless of how revenue is tracking." />
+            <Row label="Needs Attention" formula="YTD Revenue Achievement % < 80%" note="YTD Revenue Achievement % = Actual Revenue (YTD) ÷ YTD Budget." />
+            <Row label="Watch" formula="YTD Revenue Achievement % between 80% and 95%" />
+            <Row label="On Track" formula="Everything else — 95%+ achievement with no margin gap" />
+            <div style={{ fontSize: 11, color: "#8A8A8A", marginTop: 4 }}>These thresholds (3pts, 80%, 95%) are a reasonable starting point, not a validated policy — worth tuning if they don't match how the business actually thinks about "at risk."</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 20 }}>
+          <button onClick={onClose} style={styles.secondaryBtn}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VendorDrilldownModal({ vendor, year, completed, isBudgetingOrFuture, onClose, fmtN }) {
+  const { unit } = useNumberUnit();
+  const chartData = MONTHS.map((m, i) => ({
+    month: m,
+    "Budget Revenue": Math.round(vendor.monthly_budget_revenue[i] || 0),
+    ...(isBudgetingOrFuture ? {} : { "Actual Revenue": vendor.monthly_actual_revenue[i] || null }),
+  }));
+  const gpChartData = MONTHS.map((m, i) => ({
+    month: m,
+    "Budget GP": Math.round(vendor.monthly_budget_gp[i] || 0),
+    ...(isBudgetingOrFuture ? {} : { "Actual GP": vendor.monthly_actual_gp[i] || null }),
+  }));
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modalCard, width: "90vw", maxWidth: 1000, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 18 }}>{vendor.vendor}</div>
+            <div style={{ fontSize: 12, color: "#6B6B6B" }}>
+              {vendor.bu_head ? `BU Head: ${vendor.bu_head}` : "BU Head: —"} · {(vendor.regions || []).length ? `Sub-Regions: ${vendor.regions.join(", ")}` : "Sub-Regions: —"}
+              {vendor.tier && ` · Tier: ${vendor.tier}`}
+            </div>
+          </div>
+          {!isBudgetingOrFuture && <span style={{ fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 6, color: "#FFFFFF", background: STATUS_COLORS[vendor.status] }}>{STATUS_LABELS[vendor.status]}</span>}
+          <button onClick={onClose} style={{ ...styles.iconBtnGhost, marginLeft: 10, flexShrink: 0 }} title="Close"><X size={16} /></button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: isBudgetingOrFuture ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 10, margin: "16px 0" }}>
+          <DrilldownStat label="FY Budget" value={fmtN(vendor.budget_revenue)} />
+          {isBudgetingOrFuture ? (
+            <DrilldownStat label="FY Budget GP" value={fmtN(vendor.budget_gp)} />
+          ) : completed ? (
+            <>
+              <DrilldownStat label="FY Actual" value={fmtN(vendor.actual_revenue_ytd)} />
+              <DrilldownStat label="FY Variance" value={`${vendor.fyVarAmt >= 0 ? "+" : ""}${fmtN(vendor.fyVarAmt)}`} color={vendor.fyVarAmt >= 0 ? "#1B8A3A" : "#C00000"} />
+              <DrilldownStat label="FY Var %" value={fmtSignedPct(vendor.fyVarPct)} color={vendor.fyVarPct >= 0 ? "#1B8A3A" : "#C00000"} />
+            </>
+          ) : (
+            <>
+              <DrilldownStat label="YTD Achievement" value={fmtPct(vendor.ytdAchievementPct)} />
+              <DrilldownStat label="FY System Forecast" value={fmtN(vendor.fyForecastRevenue)} />
+              <DrilldownStat label="Forecast Achievement" value={fmtPct(vendor.forecastAchievementPct)} />
+            </>
+          )}
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{isBudgetingOrFuture ? "Revenue — Budget Phasing" : "Revenue — Budget vs Actual"}</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={chartData} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="month" fontSize={11} stroke="#6B6B6B" />
+            <YAxis fontSize={11} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Legend />
+            <Line type="monotone" dataKey="Budget Revenue" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+            {!isBudgetingOrFuture && <Line type="monotone" dataKey="Actual Revenue" stroke="#C00000" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />}
+          </LineChart>
+        </ResponsiveContainer>
+
+        <div style={{ fontSize: 13, fontWeight: 600, margin: "16px 0 8px" }}>{isBudgetingOrFuture ? "Gross Profit — Budget Phasing" : "Gross Profit — Budget vs Actual"}</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={gpChartData} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="month" fontSize={11} stroke="#6B6B6B" />
+            <YAxis fontSize={11} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Legend />
+            <Line type="monotone" dataKey="Budget GP" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+            {!isBudgetingOrFuture && <Line type="monotone" dataKey="Actual GP" stroke="#1B8A3A" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />}
+          </LineChart>
+        </ResponsiveContainer>
+
+        {!isBudgetingOrFuture && (
+          <>
+            <div style={{ fontSize: 13, fontWeight: 600, margin: "16px 0 8px" }}>Sub-Region Performance — Actual Revenue</div>
+            {Object.keys(vendor.region_revenue || {}).length === 0 ? (
+              <div style={{ fontSize: 12, color: "#6B6B6B" }}>No sub-region breakdown available for this vendor.</div>
+            ) : (
+              <ResponsiveContainer width="100%" height={Math.max(160, Object.keys(vendor.region_revenue).length * 34)}>
+                <BarChart
+                  data={Object.entries(vendor.region_revenue).map(([name, rev]) => ({ subRegion: `${flagFor(name)} ${name}`, Revenue: Math.round(rev) })).sort((a, b) => b.Revenue - a.Revenue)}
+                  layout="vertical" margin={{ top: 6, right: 16, left: 0, bottom: 0 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+                  <XAxis type="number" fontSize={11} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} />
+                  <YAxis type="category" dataKey="subRegion" fontSize={11} stroke="#6B6B6B" width={130} />
+                  <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+                  <Bar dataKey="Revenue" fill="#C00000" radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+          <button onClick={onClose} style={styles.secondaryBtn}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DrilldownStat({ label, value, color }) {
+  return (
+    <div style={{ background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 8, padding: "10px 12px" }}>
+      <div style={{ fontSize: 10.5, color: "#6B6B6B", fontWeight: 600, marginBottom: 3 }}>{label}</div>
+      <div className="num" style={{ fontSize: 16, fontWeight: 700, color: color || "#111111" }}>{value}</div>
+    </div>
+  );
+}
+
+// ---- Region Management Performance View (historical/in-progress years) ---
+// Mirrors VendorPerformanceView's structure/logic exactly (reuses the same
+// computeFySystemForecast/computeVendorStatus — region rows are shaped
+// identically to vendor rows so no region-specific version of either was
+// needed), plus a region/sub-region/country granularity toggle that
+// vendors don't have. Not built: a "Management Forecast" override — that
+// was scoped as a per-vendor judgment call in the original ask; flagging
+// this as an intentional omission, not an oversight, in case regions
+// should have one too.
+function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario }) {
+  const { fmtN } = useNumberUnit();
+  const completed = isYearCompleted(year);
+  const yearClass = classifyYear(year, activeBudgetingYear);
+  const isBudgetingOrFuture = yearClass === "current_budgeting_year" || yearClass === "future_budgeting_year";
+  const cutoffIdx = getActualCutoffMonthIndex(year);
+
+  const [granularity, setGranularity] = useState("subRegion"); // "region" | "subRegion" | "country"
+  const [regions, setRegions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [regionSearch, setRegionSearch] = useState("");
+  const [quickFilter, setQuickFilter] = useState("all");
+  const [metricView, setMetricView] = useState("revenue");
+  const [sortKey, setSortKey] = useState("budget_revenue");
+  const [sortDir, setSortDir] = useState("desc");
+  const [drilldownRegion, setDrilldownRegion] = useState(null);
+  const [formulasOpen, setFormulasOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getRegionPerformanceData(year, granularity, scenario)
+      .then(rows => { if (!cancelled) setRegions(rows); })
+      .catch(e => { console.error("RegionPerformanceView load failed:", e); showToast(`Couldn't load region data: ${e.message}`); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [year, granularity, scenario]);
+
+  const enriched = useMemo(() => {
+    return regions.map(r => {
+      const { fyForecastRevenue, fyForecastGp } = computeFySystemForecast(r, year);
+      const status = computeVendorStatus(r);
+      const ytdVarAmt = r.actual_revenue_ytd - r.ytd_budget_revenue;
+      const ytdVarPct = r.ytd_budget_revenue ? ytdVarAmt / r.ytd_budget_revenue : (r.actual_revenue_ytd > 0 ? 1 : 0);
+      const ytdGpVarAmt = r.actual_gp_ytd - r.ytd_budget_gp;
+      const ytdGpVarPct = r.ytd_budget_gp ? ytdGpVarAmt / r.ytd_budget_gp : 0;
+      const forecastVarAmt = fyForecastRevenue - r.budget_revenue;
+      const forecastVarPct = r.budget_revenue ? forecastVarAmt / r.budget_revenue : 0;
+      const forecastAchievementPct = r.budget_revenue ? fyForecastRevenue / r.budget_revenue : 0;
+      const forecastGpVarAmt = fyForecastGp - r.budget_gp;
+      const forecastGpVarPct = r.budget_gp ? forecastGpVarAmt / r.budget_gp : 0;
+      const fyVarAmt = r.actual_revenue_ytd - r.budget_revenue;
+      const fyVarPct = r.budget_revenue ? fyVarAmt / r.budget_revenue : 0;
+      const fyGpVarAmt = r.actual_gp_ytd - r.budget_gp;
+      const fyGpVarPct = r.budget_gp ? fyGpVarAmt / r.budget_gp : 0;
+      const actualGpPct = r.actual_revenue_ytd ? r.actual_gp_ytd / r.actual_revenue_ytd : 0;
+      const budgetGpPct = r.budget_revenue ? r.budget_gp / r.budget_revenue : 0;
+      return {
+        ...r, fyForecastRevenue, fyForecastGp, status,
+        ytdVarAmt, ytdVarPct, ytdGpVarAmt, ytdGpVarPct,
+        forecastVarAmt, forecastVarPct, forecastAchievementPct, forecastGpVarAmt, forecastGpVarPct,
+        fyVarAmt, fyVarPct, fyGpVarAmt, fyGpVarPct,
+        actualGpPct, budgetGpPct,
+      };
+    });
+  }, [regions, year]);
+
+  const belowPlanCount = enriched.filter(r => r.ytdVarAmt < 0).length;
+  const atRiskCount = enriched.filter(r => r.status === "margin_risk").length;
+  const gpBelowBudgetCount = enriched.filter(r => r.actualGpPct < r.budgetGpPct - 0.01).length;
+  const aheadCount = enriched.filter(r => r.ytdVarPct > 0.15).length;
+
+  const filtered = useMemo(() => {
+    let rows = enriched;
+    if (regionSearch) rows = rows.filter(r => r.name.toLowerCase().includes(regionSearch.toLowerCase()));
+    if (quickFilter === "needs_attention") rows = rows.filter(r => r.status === "needs_attention");
+    else if (quickFilter === "margin_risk") rows = rows.filter(r => r.status === "margin_risk");
+    else if (quickFilter === "on_track") rows = rows.filter(r => r.status === "on_track");
+    else if (quickFilter === "ahead") rows = rows.filter(r => r.ytdVarPct > 0.15);
+    return [...rows].sort((a, b) => {
+      const dir = sortDir === "asc" ? 1 : -1;
+      return ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir;
+    });
+  }, [enriched, regionSearch, quickFilter, sortKey, sortDir]);
+
+  const handleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir("desc"); }
+  };
+
+  const varKey = metricView === "gp" ? "ytdGpVarAmt" : "ytdVarAmt";
+  const varPctKey = metricView === "gp" ? "ytdGpVarPct" : "ytdVarPct";
+  const fyVarKey = metricView === "gp" ? "fyGpVarAmt" : "fyVarAmt";
+  const fyVarPctKey = metricView === "gp" ? "fyGpVarPct" : "fyVarPct";
+  const forecastVarKey = metricView === "gp" ? "forecastGpVarAmt" : "forecastVarAmt";
+  const forecastVarPctKey = metricView === "gp" ? "forecastGpVarPct" : "forecastVarPct";
+  const budgetKey = metricView === "gp" ? "budget_gp" : "budget_revenue";
+  const ytdBudgetKey = metricView === "gp" ? "ytd_budget_gp" : "ytd_budget_revenue";
+  const actualKey = metricView === "gp" ? "actual_gp_ytd" : "actual_revenue_ytd";
+  const fyForecastKey = metricView === "gp" ? "fyForecastGp" : "fyForecastRevenue";
+  const granularityLabel = { region: "Region", subRegion: "Sub-Region", country: "Country" };
+
+  // Same totals-row convention as VendorPerformanceView — sums the
+  // filtered/searched list, Var% derived from summed budget & actual
+  // rather than averaging each row's own %. No mgmtForecast here since
+  // region-level Management Forecast doesn't exist (see PROJECT_HANDOFF).
+  const totals = useMemo(() => {
+    const sum = (key) => filtered.reduce((s, r) => s + (r[key] || 0), 0);
+    const budget = sum(budgetKey), ytdBudget = sum(ytdBudgetKey), actual = sum(actualKey);
+    const fyForecast = sum(fyForecastKey);
+    const varBase = completed ? budget : ytdBudget;
+    const varTotal = actual - varBase;
+    const forecastVarTotal = fyForecast - budget;
+    return {
+      budget, ytdBudget, actual, fyForecast, varTotal,
+      varPct: varBase ? varTotal / varBase : 0,
+      forecastVarTotal, forecastVarPct: budget ? forecastVarTotal / budget : 0,
+    };
+  }, [filtered, budgetKey, ytdBudgetKey, actualKey, fyForecastKey, completed]);
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
+          {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
+            : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
+            : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setFormulasOpen(true)} style={{ ...styles.secondaryBtn, fontSize: 12 }} title="How these numbers are calculated">ƒ Formulas</button>
+          <div style={styles.unitToggle}>
+            {[["revenue", "Revenue"], ["gp", "GP"]].map(([val, label]) => (
+              <button key={val} onClick={() => setMetricView(val)} style={{ ...styles.unitToggleBtn, ...(metricView === val ? styles.unitToggleBtnActive : {}) }}>{label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {formulasOpen && <FormulasModal onClose={() => setFormulasOpen(false)} />}
+
+      {!completed && !isBudgetingOrFuture && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+          <AttentionCard label="Below Plan" value={belowPlanCount} color="#C00000" onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
+          <AttentionCard label="At Risk" value={atRiskCount} color="#7A3F9A" onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
+          <AttentionCard label="GP% Below Budget" value={gpBelowBudgetCount} color="#8A6D1A" onClick={() => setMetricView("gp")} active={metricView === "gp"} />
+          <AttentionCard label="Significantly Ahead" value={aheadCount} color="#1B8A3A" onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 6, alignItems: "center" }}>
+        <div style={styles.searchBox}><Search size={14} color="#6B6B6B" /><input value={regionSearch} onChange={(e) => setRegionSearch(e.target.value)} placeholder={`Search ${granularityLabel[granularity].toLowerCase()}…`} style={styles.searchInput} /></div>
+        <div style={styles.plViewToggle}>
+          {[["region", "Region"], ["subRegion", "Sub-Region"], ["country", "Country"]].map(([k, label]) => (
+            <button key={k} onClick={() => setGranularity(k)} style={{ ...styles.plToggleBtn, ...(granularity === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+          ))}
+        </div>
+        {!completed && !isBudgetingOrFuture && (
+          <div style={styles.plViewToggle}>
+            {QUICK_FILTERS.map(([k, label]) => (
+              <button key={k} onClick={() => setQuickFilter(k)} style={{ ...styles.plToggleBtn, ...(quickFilter === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+            ))}
+          </div>
+        )}
+      </div>
+      {granularity === "country" && (
+        <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 14 }}>
+          Country-level budget and actuals come from different source columns (Zoho's budget "Country" field vs. CIPR's "Billing Country") and may not always match by name — Region and Sub-Region granularity don't have this risk, since both sources carry those exact same attributes.
+        </div>
+      )}
+
+      <div style={styles.panel}>
+        {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : filtered.length === 0 ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>No data for this filter.</div> : (
+        <div style={styles.tableScroll}>
+          <table style={styles.table}>
+            {isBudgetingOrFuture ? (
+              <>
+                <thead>
+                  <tr>
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>{granularityLabel[granularity]}</th>
+                    <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(r => (
+                    <tr key={r.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.name}</td>
+                      <td className="num" style={styles.td}>{fmtN(r[budgetKey])}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #111111" }}>
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
+                  </tr>
+                </tfoot>
+              </>
+            ) : (
+              <>
+                <thead>
+                  <tr>
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>{granularityLabel[granularity]}</th>
+                    {!completed && <th style={{ ...styles.th, textAlign: "left" }}>Status</th>}
+                    <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    {!completed && <SortableTh label="YTD Budget" sortKeyName={ytdBudgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    <SortableTh label={completed ? "FY Actual" : "YTD Actual"} sortKeyName={actualKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    <SortableTh label={completed ? "FY Var" : "YTD Var"} sortKeyName={completed ? fyVarKey : varKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    <SortableTh label={completed ? "FY Var %" : "YTD Var %"} sortKeyName={completed ? fyVarPctKey : varPctKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+                    {!completed && <SortableTh label="FY Forecast (System)" sortKeyName={fyForecastKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    {!completed && <SortableTh label="Forecast Var" sortKeyName={forecastVarKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                    {!completed && <SortableTh label="Forecast Var %" sortKeyName={forecastVarPctKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(r => (
+                    <tr key={r.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.name}</td>
+                      {!completed && (
+                        <td style={{ ...styles.td, textAlign: "left" }}>
+                          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 5, color: "#FFFFFF", background: STATUS_COLORS[r.status] }}>{STATUS_LABELS[r.status]}</span>
+                        </td>
+                      )}
+                      <td className="num" style={styles.td}>{fmtN(r[budgetKey])}</td>
+                      {!completed && <td className="num" style={styles.td}>{fmtN(r[ytdBudgetKey])}</td>}
+                      <td className="num" style={styles.td}>{fmtN(r[actualKey])}</td>
+                      <td className="num" style={{ ...styles.td, color: r[completed ? fyVarKey : varKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{r[completed ? fyVarKey : varKey] >= 0 ? "+" : ""}{fmtN(r[completed ? fyVarKey : varKey])}</td>
+                      <td className="num" style={{ ...styles.td, color: r[completed ? fyVarPctKey : varPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(r[completed ? fyVarPctKey : varPctKey])}</td>
+                      {!completed && <td className="num" style={styles.td}>{fmtN(r[fyForecastKey])}</td>}
+                      {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{r[forecastVarKey] >= 0 ? "+" : ""}{fmtN(r[forecastVarKey])}</td>}
+                      {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(r[forecastVarPctKey])}</td>}
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #111111" }}>
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
+                    {!completed && <td style={styles.td}></td>}
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.ytdBudget)}</td>}
+                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.actual)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varTotal >= 0 ? "#1B8A3A" : "#C00000" }}>{totals.varTotal >= 0 ? "+" : ""}{fmtN(totals.varTotal)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varPct >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(totals.varPct)}</td>
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.fyForecast)}</td>}
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.forecastVarTotal >= 0 ? "#1B8A3A" : "#C00000" }}>{totals.forecastVarTotal >= 0 ? "+" : ""}{fmtN(totals.forecastVarTotal)}</td>}
+                    {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.forecastVarPct >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(totals.forecastVarPct)}</td>}
+                  </tr>
+                </tfoot>
+              </>
+            )}
+          </table>
+        </div>
+        )}
+      </div>
+
+      {drilldownRegion && (
+        <RegionDrilldownModal region={drilldownRegion} year={year} completed={completed} isBudgetingOrFuture={isBudgetingOrFuture} granularityLabel={granularityLabel[granularity]} onClose={() => setDrilldownRegion(null)} fmtN={fmtN} />
+      )}
+    </div>
+  );
+}
+
+function RegionDrilldownModal({ region, year, completed, isBudgetingOrFuture, granularityLabel, onClose, fmtN }) {
+  const { unit } = useNumberUnit();
+  const chartData = MONTHS.map((m, i) => ({
+    month: m,
+    "Budget Revenue": Math.round(region.monthly_budget_revenue[i] || 0),
+    ...(isBudgetingOrFuture ? {} : { "Actual Revenue": region.monthly_actual_revenue[i] || null }),
+  }));
+  const gpChartData = MONTHS.map((m, i) => ({
+    month: m,
+    "Budget GP": Math.round(region.monthly_budget_gp[i] || 0),
+    ...(isBudgetingOrFuture ? {} : { "Actual GP": region.monthly_actual_gp[i] || null }),
+  }));
+  const fyVarAmt = region.actual_revenue_ytd - region.budget_revenue;
+  const fyVarPct = region.budget_revenue ? fyVarAmt / region.budget_revenue : 0;
+  const ytdAchievementPct = region.ytd_budget_revenue ? region.actual_revenue_ytd / region.ytd_budget_revenue : 0;
+  const forecastAchievementPct = region.budget_revenue ? region.fyForecastRevenue / region.budget_revenue : 0;
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modalCard, width: "90vw", maxWidth: 1000, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 18 }}>{region.name}</div>
+            <div style={{ fontSize: 12, color: "#6B6B6B" }}>{granularityLabel}</div>
+          </div>
+          {!completed && !isBudgetingOrFuture && <span style={{ fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 6, color: "#FFFFFF", background: STATUS_COLORS[region.status] }}>{STATUS_LABELS[region.status]}</span>}
+          <button onClick={onClose} style={{ ...styles.iconBtnGhost, marginLeft: 10, flexShrink: 0 }} title="Close"><X size={16} /></button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: isBudgetingOrFuture ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 10, margin: "16px 0" }}>
+          <DrilldownStat label="FY Budget" value={fmtN(region.budget_revenue)} />
+          {isBudgetingOrFuture ? (
+            <DrilldownStat label="FY Budget GP" value={fmtN(region.budget_gp)} />
+          ) : completed ? (
+            <>
+              <DrilldownStat label="FY Actual" value={fmtN(region.actual_revenue_ytd)} />
+              <DrilldownStat label="FY Variance" value={`${fyVarAmt >= 0 ? "+" : ""}${fmtN(fyVarAmt)}`} color={fyVarAmt >= 0 ? "#1B8A3A" : "#C00000"} />
+              <DrilldownStat label="FY Var %" value={fmtSignedPct(fyVarPct)} color={fyVarPct >= 0 ? "#1B8A3A" : "#C00000"} />
+            </>
+          ) : (
+            <>
+              <DrilldownStat label="YTD Achievement" value={fmtPct(ytdAchievementPct)} />
+              <DrilldownStat label="FY System Forecast" value={fmtN(region.fyForecastRevenue)} />
+              <DrilldownStat label="Forecast Achievement" value={fmtPct(forecastAchievementPct)} />
+            </>
+          )}
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{isBudgetingOrFuture ? "Revenue — Budget Phasing" : "Revenue — Budget vs Actual"}</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={chartData} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="month" fontSize={11} stroke="#6B6B6B" />
+            <YAxis fontSize={11} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Legend />
+            <Line type="monotone" dataKey="Budget Revenue" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+            {!isBudgetingOrFuture && <Line type="monotone" dataKey="Actual Revenue" stroke="#C00000" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />}
+          </LineChart>
+        </ResponsiveContainer>
+
+        <div style={{ fontSize: 13, fontWeight: 600, margin: "16px 0 8px" }}>{isBudgetingOrFuture ? "Gross Profit — Budget Phasing" : "Gross Profit — Budget vs Actual"}</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={gpChartData} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="month" fontSize={11} stroke="#6B6B6B" />
+            <YAxis fontSize={11} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+            <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Legend />
+            <Line type="monotone" dataKey="Budget GP" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+            {!isBudgetingOrFuture && <Line type="monotone" dataKey="Actual GP" stroke="#1B8A3A" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />}
+          </LineChart>
+        </ResponsiveContainer>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+          <button onClick={onClose} style={styles.secondaryBtn}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Assumptions (presentation-ready, for COO/management visibility) -----
+const ASSUMPTION_CATEGORIES = ["Data Sources", "Financial", "Budgeting", "Currency", "HR & Benefits", "Performance Thresholds"];
+
+function AssumptionsTab({ showToast, skoUplift }) {
+  const [assumptions, setAssumptions] = useState([]);
+  const [thresholds, setThresholds] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [rows, benefitThresholds] = await Promise.all([getAssumptions(), getBenefitThresholds()]);
+      setAssumptions(rows);
+      setThresholds(benefitThresholds);
+    } catch (e) {
+      console.error("AssumptionsTab load failed:", e);
+      showToast(`Couldn't load assumptions: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const handleSeed = async () => {
+    try {
+      await Promise.all(DEFAULT_ASSUMPTIONS.map(a => addAssumption(a)));
+      await load();
+      showToast(`Added ${DEFAULT_ASSUMPTIONS.length} example assumptions — edit or remove any of them freely.`);
+    } catch (e) {
+      showToast(`Couldn't seed assumptions: ${e.message}`);
+    }
+  };
+
+  const handleSave = async (fields) => {
+    try {
+      if (editing) await updateAssumption(editing.id, fields);
+      else await addAssumption(fields);
+      setFormOpen(false); setEditing(null);
+      await load();
+    } catch (e) {
+      showToast(`Couldn't save: ${e.message}`);
+    }
+  };
+
+  const handleRemove = async (id, label) => {
+    if (!window.confirm(`Remove "${label}"?`)) return;
+    try {
+      await removeAssumption(id);
+      await load();
+    } catch (e) {
+      showToast(`Couldn't remove: ${e.message}`);
+    }
+  };
+
+  const grouped = ASSUMPTION_CATEGORIES.map(cat => ({ category: cat, items: assumptions.filter(a => a.category === cat) }))
+    .filter(g => g.items.length > 0);
+  const otherItems = assumptions.filter(a => !ASSUMPTION_CATEGORIES.includes(a.category));
+  if (otherItems.length) grouped.push({ category: "Other", items: otherItems });
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>
+          A single place to see and edit the assumptions and data sources this app runs on — useful for a quick "what's this built on" review. Example/placeholder values below, not finalized finance policy.
+        </div>
+        <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Assumption</button>
+      </div>
+
+      {formOpen && <AssumptionFormModal initial={editing} onCancel={() => { setFormOpen(false); setEditing(null); }} onSave={handleSave} />}
+
+      {/* Live section — pulled directly from real running app config, not
+          a separately-stored (and potentially stale) copy. */}
+      <div style={styles.panel}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <div style={styles.panelTitle}>Live System Configuration</div>
+          <span style={{ fontSize: 9.5, fontWeight: 700, color: "#1B8A3A", background: "#E8F5E9", borderRadius: 4, padding: "2px 7px" }}>● LIVE</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>These reflect the actual current app configuration, not a manually-entered value that could drift out of sync.</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 12 }}>
+          <LiveAssumptionCard label="SKO Uplift" value={`${Math.round(skoUplift * 100)}%`} description="Applied to Macnica budget to approximate SKO budget (SKO actuals are real, pulled from CIPR's own inclusion flags — only budget is an uplift approximation)." />
+          {thresholds && (
+            <>
+              <LiveAssumptionCard label="Insurance Eligibility" value={thresholds.insuranceMonths === 0 ? "Day 1" : `${thresholds.insuranceMonths} months`} description="Employee benefit eligibility, from Employees tab settings." />
+              <LiveAssumptionCard label="Airfare Eligibility" value={`${thresholds.airfareMonths} months`} description="Employee benefit eligibility, from Employees tab settings." />
+              <LiveAssumptionCard label="Gratuity Eligibility" value={`${thresholds.gratuityMonths} months`} description="Employee benefit eligibility, from Employees tab settings." />
+              <LiveAssumptionCard label="ESOP Eligibility" value={`${thresholds.esopMonths} months`} description="Employee benefit eligibility, from Employees tab settings." />
+            </>
+          )}
+          <LiveAssumptionCard label="Vendor Status: Margin Risk" value="GP% 3+ pts below budget" description="Checked first, takes priority over revenue pace — see Formulas popup on the Vendors tab." />
+          <LiveAssumptionCard label="Vendor Status: Needs Attention" value="< 80% YTD achievement" description="Revenue pace threshold — see Formulas popup on the Vendors tab." />
+          <LiveAssumptionCard label="Vendor Status: On Track" value="≥ 95% YTD achievement" description="Revenue pace threshold — see Formulas popup on the Vendors tab." />
+        </div>
+      </div>
+
+      {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : assumptions.length === 0 ? (
+        <div style={styles.panel}>
+          <div style={styles.emptyState}>
+            <div style={{ fontSize: 14, marginBottom: 10 }}>No assumptions added yet.</div>
+            <button onClick={handleSeed} style={styles.primaryBtn}>+ Add Example Assumptions</button>
+          </div>
+        </div>
+      ) : (
+        grouped.map(g => (
+          <div key={g.category} style={styles.panel}>
+            <div style={styles.panelTitle}>{g.category}</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 12, marginTop: 10 }}>
+              {g.items.map(a => (
+                <div key={a.id} style={{ background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 10, padding: 14, position: "relative" }}>
+                  <div style={{ position: "absolute", top: 8, right: 8, display: "flex", gap: 3 }}>
+                    <button onClick={() => { setEditing(a); setFormOpen(true); }} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }} title="Edit"><Sliders size={10} /></button>
+                    <button onClick={() => handleRemove(a.id, a.label)} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }} title="Remove"><X size={10} /></button>
+                  </div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#6B6B6B", marginBottom: 4 }}>{a.label}</div>
+                  <div className="num" style={{ fontSize: 19, fontWeight: 700, marginBottom: 6 }}>{a.value}{a.unit ? ` ${a.unit}` : ""}</div>
+                  {a.description && <div style={{ fontSize: 11.5, color: "#6B6B6B", lineHeight: 1.4 }}>{a.description}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function LiveAssumptionCard({ label, value, description }) {
+  return (
+    <div style={{ background: "#F0F8F0", border: "1px solid #C8E6C9", borderRadius: 10, padding: 14 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: "#1B8A3A", marginBottom: 4 }}>{label}</div>
+      <div className="num" style={{ fontSize: 17, fontWeight: 700, marginBottom: 6 }}>{value}</div>
+      <div style={{ fontSize: 11, color: "#6B6B6B", lineHeight: 1.4 }}>{description}</div>
+    </div>
+  );
+}
+
+function AssumptionFormModal({ initial, onCancel, onSave }) {
+  const [category, setCategory] = useState(initial?.category || ASSUMPTION_CATEGORIES[0]);
+  const [label, setLabel] = useState(initial?.label || "");
+  const [value, setValue] = useState(initial?.value || "");
+  const [unit, setUnit] = useState(initial?.unit || "");
+  const [description, setDescription] = useState(initial?.description || "");
+
+  const handleSave = () => {
+    if (!label.trim() || !value.toString().trim()) return;
+    onSave({ category, label: label.trim(), value: value.toString().trim(), unit: unit.trim(), description: description.trim() });
+  };
+
+  return (
+    <div style={styles.modalOverlay} onClick={onCancel}>
+      <div style={{ ...styles.modalCard, maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>{initial ? "Edit Assumption" : "Add Assumption"}</div>
+          <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Category</div>
+          <select value={category} onChange={(e) => setCategory(e.target.value)} style={{ ...styles.yearSelect, width: "100%" }}>
+            {ASSUMPTION_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+          <div style={{ flex: 2 }}>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Label<RequiredStar /></div>
+            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Interest Rate on Loans" style={{ ...styles.chatInput, background: "#FFFFFF", width: "100%" }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Value<RequiredStar /></div>
+            <input value={value} onChange={(e) => setValue(e.target.value)} placeholder="10" style={{ ...styles.chatInput, background: "#FFFFFF", width: "100%" }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Unit</div>
+            <input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="% p.a." style={{ ...styles.chatInput, background: "#FFFFFF", width: "100%" }} />
+          </div>
+        </div>
+        <div style={{ marginBottom: 4 }}>
+          <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Description</div>
+          <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} style={{ ...styles.chatTextarea, width: "100%" }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
+          <button onClick={handleSave} style={styles.primaryBtn} disabled={!label.trim() || !value.toString().trim()}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Operational Stats -----------------------------------------------------
+function OperationalStatsTab({ showToast, year }) {
+  const { fmtN } = useNumberUnit();
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getInvoicesByYearRange(year, 2023)
+      .then(byYear => { if (!cancelled) setStats(computeOperationalStats(byYear, year)); })
+      .catch(e => { console.error("OperationalStatsTab load failed:", e); showToast(`Couldn't load operational stats: ${e.message}`); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [year]);
+
+  if (loading) return <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading operational stats for {year} (and prior years, to compute what's new)…</div>;
+  if (!stats) return null;
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
+        Computed from raw invoice-level actuals (CIPR) for {year}. "New this year" compares against every prior year synced (2023 onward) — an entity only counts as new if it's never appeared before.
+      </div>
+
+      <div style={styles.kpiGrid}>
+        <KpiCard label="Invoices" value={stats.invoiceCount.toLocaleString()} />
+        <KpiCard label="Vendors" value={stats.vendorCount.toLocaleString()} sub={`+${stats.newVendors} new this year`} />
+        <KpiCard label="Customers" value={stats.customerCount.toLocaleString()} sub={`+${stats.newCustomers} new this year`} />
+        <KpiCard label="End Customers" value={stats.endCustomerCount.toLocaleString()} sub={`+${stats.newEndCustomers} new this year`} />
+        <KpiCard label="Countries" value={stats.countryCount.toLocaleString()} sub={`+${stats.newCountries} new this year`} />
+        <KpiCard label="Average Deal Size" value={fmtN(stats.avgDealSize)} />
+        <KpiCard label="Deals Above 20% Margin" value={stats.dealsAbove20Margin.toLocaleString()} />
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Revenue Buckets — Deal Size Distribution</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={stats.revenueBuckets} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="label" fontSize={12} stroke="#6B6B6B" />
+            <YAxis fontSize={12} stroke="#6B6B6B" allowDecimals={false} />
+            <Tooltip formatter={(v, name) => name === "count" ? `${v} deals` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Bar dataKey="count" name="count" radius={[4, 4, 0, 0]}>
+              {stats.revenueBuckets.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>GP% Buckets — Margin Distribution</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={stats.gpBuckets} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="label" fontSize={12} stroke="#6B6B6B" />
+            <YAxis fontSize={12} stroke="#6B6B6B" allowDecimals={false} />
+            <Tooltip formatter={(v, name) => name === "count" ? `${v} deals` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Bar dataKey="count" name="count" radius={[4, 4, 0, 0]}>
+              {stats.gpBuckets.map((_, i) => <Cell key={i} fill={DEPT_COLORS[(i + 6) % DEPT_COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {stats.segments.length > 0 && (
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Segment-wise Revenue (ZTX Framework)</div>
+          <ResponsiveContainer width="100%" height={Math.max(160, stats.segments.length * 32)}>
+            <BarChart data={stats.segments} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis type="number" fontSize={12} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} />
+              <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={160} />
+              <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+              <Bar dataKey="revenue" radius={[0, 4, 4, 0]}>
+                {stats.segments.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {stats.trend.length > 1 && (
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Multi-Year Trend</div>
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={stats.trend} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+              <XAxis dataKey="year" fontSize={12} stroke="#6B6B6B" />
+              <YAxis fontSize={12} stroke="#6B6B6B" allowDecimals={false} />
+              <Tooltip contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+              <Legend />
+              <Line type="monotone" dataKey="Invoices" stroke="#C00000" strokeWidth={2} dot={{ r: 3 }} />
+              <Line type="monotone" dataKey="Vendors" stroke="#2A5C9A" strokeWidth={2} dot={{ r: 3 }} />
+              <Line type="monotone" dataKey="Customers" stroke="#1B8A3A" strokeWidth={2} dot={{ r: 3 }} />
+              <Line type="monotone" dataKey="End Customers" stroke="#8A6D1A" strokeWidth={2} dot={{ r: 3 }} />
+              <Line type="monotone" dataKey="Countries" stroke="#7C3AED" strokeWidth={2} dot={{ r: 3 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Cash Flow module — AR (CIPR) vs AP (Bills) by due date -------------
+// See Cash_Flow_Module_Requirements2.md. The chart/KPIs/ledger below are
+// NOT year-scoped — a due date can fall in a different calendar year than
+// the record's own source-partition year, so getCashFlowRawData always
+// pulls the full multi-year window and everything here buckets strictly
+// by due date, regardless of which year is selected up top. The app's
+// existing top-bar Year selector is reused here for exactly one purpose:
+// picking which year's Bills to sync — Bills is a brand-new source this
+// module introduces, so unlike CIPR (already backfilled years ago) there's
+// no historical billsActuals data yet, and each past year needs its own
+// manual sync call the same way syncCipr originally did. AR refreshes via
+// the existing top-bar "Sync Now" button (syncCipr already captures every
+// field this module needs — see cashFlowData.js's header comment); only
+// AP needs its own sync button here.
+function CashFlowTab({ showToast, year }) {
+  const { fmtN } = useNumberUnit();
+  const [granularity, setGranularity] = useState("month");
+  const [raw, setRaw] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const data = await getCashFlowRawData();
+      setRaw(data);
+    } catch (e) {
+      console.error("CashFlowTab load failed:", e);
+      showToast(`Couldn't load cash flow data: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const handleSyncBills = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const result = await syncBillsNow(year);
+      await load();
+      showToast(`Synced ${result.billRowsSynced} bill rows for ${result.year}. (AR refreshes with the main Sync button in the top bar.)`);
+    } catch (e) {
+      showToast(`Bills sync failed: ${e.message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const cf = useMemo(() => {
+    if (!raw) return null;
+    return computeCashFlow(raw.invoices, raw.bills, granularity);
+  }, [raw, granularity]);
+
+  if (loading) return <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading cash flow data (AR from CIPR, AP from Bills)…</div>;
+  if (!cf) return null;
+
+  const { periods, currentIndex, kpis, agedAR, agedAP } = cf;
+  const chartData = periods.map((p) => ({ label: p.label, AR: p.ar, AP: -p.ap, Net: p.net }));
+  const currentLabel = periods[currentIndex]?.label;
+  // Visual scale only — bars read relative to a 90-day reference, not a
+  // hard max (an actual figure above 90 just fills the track).
+  const scalePct = (days) => Math.max(4, Math.min(100, Math.round(((days || 0) / 90) * 100)));
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A", maxWidth: 620 }}>
+          AR = open Balance from CIPR invoices, bucketed by Due Date. AP = open Balance(USD) from Bills, bucketed by Due Date. Same due-date field drives every granularity below (§3.4) — paid-in-full rows (Balance = 0) are excluded from both.
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={styles.scenarioToggle}>
+            {["day", "week", "month", "quarter", "year"].map((g) => (
+              <button key={g} onClick={() => setGranularity(g)} style={{ ...styles.scenarioBtn, ...(granularity === g ? styles.scenarioBtnActive : {}) }}>
+                {g[0].toUpperCase() + g.slice(1)}
+              </button>
+            ))}
+          </div>
+          {/* No separate year control here on purpose — this reads the
+              app's existing top-bar Year selector. Change the year up top,
+              then click this to sync that year's Bills. Doesn't affect
+              anything else on this tab, which always shows the full
+              multi-year AR/AP window regardless of which year is selected. */}
+          <button onClick={handleSyncBills} disabled={syncing} style={styles.planBtn} title={`Pull Bills (AP) for ${year} from Zoho Analytics — change the year in the top bar to sync a different year. AR refreshes via the main Sync button up there.`}>
+            <RefreshCw size={12} style={{ marginRight: 5, ...(syncing ? { animation: "spin 1s linear infinite" } : {}) }} />
+            {syncing ? "Syncing…" : `Sync Bills ${year}`}
+          </button>
+        </div>
+      </div>
+
+      <div style={styles.kpiGrid}>
+        <KpiCard label={`AR due — ${currentLabel}`} value={fmtN(kpis.arDue)} sub="Sum of open Balance, CIPR" />
+        <KpiCard label={`AP due — ${currentLabel}`} value={fmtN(kpis.apDue)} sub="Sum of open Balance(USD), Bills" />
+        <KpiCard
+          label="Net position" value={`${kpis.isSurplus ? "+" : ""}${fmtN(kpis.net)}`}
+          sub={kpis.isSurplus ? "Surplus" : "Deficit"} trend={kpis.isSurplus ? "up" : "down"}
+        />
+        <KpiCard label="Avg customer terms" value={kpis.avgCustomerTermsDays != null ? `${kpis.avgCustomerTermsDays.toFixed(0)} days` : "—"} sub="CIPR: due − invoice date" />
+        <KpiCard label="DSO" value={kpis.dsoDays != null ? `${kpis.dsoDays.toFixed(0)} days` : "—"} sub="Collcted(Days), Collected invoices" />
+        <KpiCard
+          label="Deficit periods ahead" value={`${kpis.deficitCount} of ${kpis.consideredCount}`}
+          sub={`From ${currentLabel}`} trend={kpis.deficitCount > 0 ? "down" : "up"}
+        />
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>AR vs AP by Due Date</div>
+        <div style={{ display: "flex", gap: 16, marginBottom: 10, fontSize: 11.5, color: "#6B6B6B" }}>
+          <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#1B8A3A", borderRadius: 2, marginRight: 5, verticalAlign: -1 }} />AR due (CIPR — Balance)</span>
+          <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#C00000", borderRadius: 2, marginRight: 5, verticalAlign: -1 }} />AP due (Bills — Balance USD)</span>
+          <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#8A6D1A", borderRadius: 2, marginRight: 5, verticalAlign: -1 }} />Net position</span>
+        </div>
+        <ResponsiveContainer width="100%" height={300}>
+          <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+            <XAxis dataKey="label" fontSize={11} stroke="#6B6B6B" interval={periods.length > 24 ? Math.ceil(periods.length / 24) : 0} />
+            <YAxis fontSize={12} stroke="#6B6B6B" tickFormatter={(v) => fmtN(Math.abs(v))} />
+            <Tooltip formatter={(v, name) => [fmtFull(Math.abs(v)), name]} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Bar dataKey="AR" name="AR due" fill="#1B8A3A" radius={[3, 3, 0, 0]} />
+            <Bar dataKey="AP" name="AP due" fill="#C00000" radius={[0, 0, 3, 3]} />
+            <Line type="monotone" dataKey="Net" name="Net position" stroke="#8A6D1A" strokeWidth={2} dot={{ r: 2 }} />
+            {currentLabel && <ReferenceLine x={currentLabel} stroke="#333333" strokeDasharray="3 3" label={{ value: "Current", position: "top", fontSize: 10, fill: "#6B6B6B" }} />}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.15fr .85fr", gap: 16, marginBottom: 16, alignItems: "stretch" }}>
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Average Customer Terms &amp; DSO</div>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 6 }}>
+              <span>Customers (CIPR: Due Date − Invoice Date)</span>
+              <span style={{ fontFamily: "monospace", color: "#6B6B6B" }}>{kpis.avgCustomerTermsDays != null ? `${kpis.avgCustomerTermsDays.toFixed(0)} days avg` : "no data"}</span>
+            </div>
+            <div style={{ height: 8, background: "#F0F0F0", borderRadius: 5, overflow: "hidden" }}>
+              <div style={{ height: "100%", borderRadius: 5, background: "#1B8A3A", width: `${scalePct(kpis.avgCustomerTermsDays)}%` }} />
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 18, paddingTop: 12, borderTop: "1px solid #E0E0E0" }}>
+            <div style={{ fontSize: 32, fontWeight: 700, color: "#C00000", fontFamily: "monospace" }}>{kpis.dsoDays != null ? `${kpis.dsoDays.toFixed(0)}d` : "—"}</div>
+            <div style={{ fontSize: 12, color: "#6B6B6B", lineHeight: 1.5 }}>
+              <strong style={{ color: "#333333" }}>Days Sales Outstanding</strong><br />
+              Avg of Collcted(Days) across "Collected" CIPR invoices (falls back to Last Payment Date − Invoice Date if that field is blank for a row).
+            </div>
+          </div>
+          <div style={{ marginTop: 14, padding: "9px 11px", background: "#F7F7F7", border: "1px solid #E0E0E0", borderRadius: 7, fontSize: 11.5, color: "#6B6B6B" }}>
+            Vendor terms deferred this phase — Bills' Payment Terms field isn't readable yet (raw record IDs, not term text). Will be added back once fixed on the Zoho side.
+          </div>
+        </div>
+
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>Aged Balances</div>
+          <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.04em" }}>Open &amp; overdue &gt; {AGED_THRESHOLD_DAYS} days</div>
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 6 }}>
+              <span>Aged AR ({agedAR.count} invoices)</span>
+              <span style={{ fontFamily: "monospace", color: "#1B8A3A" }}>{fmtFull(agedAR.total)}</span>
+            </div>
+            <div style={{ height: 8, background: "#F0F0F0", borderRadius: 5, overflow: "hidden" }}>
+              <div style={{ height: "100%", borderRadius: 5, background: "#1B8A3A", width: `${Math.min(100, Math.max(4, agedAR.count ? 60 : 0))}%` }} />
+            </div>
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 6 }}>
+              <span>Aged AP ({agedAP.count} bills)</span>
+              <span style={{ fontFamily: "monospace", color: "#C00000" }}>{fmtFull(agedAP.total)}</span>
+            </div>
+            <div style={{ height: 8, background: "#F0F0F0", borderRadius: 5, overflow: "hidden" }}>
+              <div style={{ height: "100%", borderRadius: 5, background: "#C00000", width: `${Math.min(100, Math.max(4, agedAP.count ? 60 : 0))}%` }} />
+            </div>
+          </div>
+          <div style={{ fontSize: 11.5, color: "#6B6B6B", paddingTop: 10, borderTop: "1px solid #E0E0E0", lineHeight: 1.5 }}>
+            Items still open with a due date more than {AGED_THRESHOLD_DAYS} days in the past. Shown separately so they don't distort the current-period surplus/deficit read above — these are collection/payment issues, not upcoming cash flow.
+          </div>
+        </div>
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Period Ledger</div>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>Positive = cash surplus, negative = cash deficit.</div>
+        <div style={styles.tableScroll}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr>
+                <th style={{ ...styles.th, textAlign: "left" }}>Period</th>
+                <th style={styles.th}>AR due</th>
+                <th style={styles.th}>AP due</th>
+                <th style={styles.th}>Net</th>
+                <th style={{ ...styles.th, textAlign: "left" }}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {periods.map((p, i) => (
+                <tr key={p.key} style={i === currentIndex ? { background: "rgba(232,183,92,0.10)" } : {}}>
+                  <td style={{ ...styles.td, textAlign: "left", fontWeight: 500 }}>{p.label}{i === currentIndex ? <span style={{ color: "#8A6D1A", fontSize: 11 }}> ← current</span> : null}</td>
+                  <td style={{ ...styles.td, color: "#1B8A3A" }}>{fmtN(p.ar)}</td>
+                  <td style={{ ...styles.td, color: "#C00000" }}>{fmtN(p.ap)}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, color: p.isSurplus ? "#1B8A3A" : "#C00000" }}>{p.isSurplus ? "+" : ""}{fmtN(p.net)}</td>
+                  <td style={{ ...styles.td, textAlign: "left" }}>
+                    <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", marginRight: 6, background: p.isSurplus ? "#1B8A3A" : "#C00000" }} />
+                    {p.isSurplus ? "Surplus" : "Deficit"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VersionsTab({ versions, onLoad, onSaveClick, activeBudgetingYear, showToast, onRefreshCurrentYear }) {
+  const [baseYear, setBaseYear] = useState((activeBudgetingYear || new Date().getFullYear() + 1) - 1);
+  const [growthPct, setGrowthPct] = useState(17);
+  const [targetYears, setTargetYears] = useState(() => {
+    const start = activeBudgetingYear || new Date().getFullYear() + 1;
+    return new Set([start, start + 1, start + 2, start + 3]);
+  });
+  const [generating, setGenerating] = useState(false);
+  const [lastResult, setLastResult] = useState(null);
+
+  const toggleYear = (y) => setTargetYears(prev => { const next = new Set(prev); next.has(y) ? next.delete(y) : next.add(y); return next; });
+
+  const handleGenerate = async () => {
+    const years = [...targetYears].sort((a, b) => a - b);
+    if (years.length === 0) { showToast("Pick at least one target year."); return; }
+    if (!window.confirm(
+      `Generate budgets for ${years.join(", ")} from ${baseYear}'s vendor list and monthly phasing, compounding ${growthPct}% growth each year?\n\n` +
+      `This will merge into (not replace) any existing entries for ${activeBudgetingYear} if it's among the target years, and will overwrite any previously-generated placeholder data for the other years.`
+    )) return;
+    setGenerating(true);
+    try {
+      const results = await generateFutureBudgets(baseYear, years, growthPct);
+      setLastResult(results);
+      showToast(`Generated budgets for ${years.join(", ")} — ${results[0]?.vendorsWritten || 0} vendors each.`);
+      onRefreshCurrentYear();
+    } catch (e) {
+      showToast(`Generation failed: ${e.message}`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const yearOptions = Array.from({ length: 6 }, (_, i) => (activeBudgetingYear || new Date().getFullYear() + 1) + i - 1); // baseYear..+4, roughly
+
+  return (
+    <div style={{ animation: "fadeIn .3s ease" }}>
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Generate Future Budgets</div>
+        <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>
+          Projects a base year's vendor list and monthly budget phasing forward across future years, compounding a growth% each year — so management has a real starting point instead of a blank sheet. The active budgeting year ({activeBudgetingYear}) is written into the actual editable budget and merged with anything already entered; other years are written as read-only placeholder budgets (same collection real Zoho syncs use — a real sync later naturally replaces the placeholder).
+        </div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Base year</div>
+            <input type="number" value={baseYear} onChange={(e) => setBaseYear(parseInt(e.target.value, 10) || baseYear)} style={{ ...styles.chatInput, background: "#FFFFFF", width: 100 }} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Growth % per year</div>
+            <input type="number" value={growthPct} onChange={(e) => setGrowthPct(parseFloat(e.target.value) || 0)} style={{ ...styles.chatInput, background: "#FFFFFF", width: 100 }} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 3 }}>Target years</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {yearOptions.filter(y => y !== baseYear).map(y => (
+                <label key={y} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12.5 }}>
+                  <input type="checkbox" checked={targetYears.has(y)} onChange={() => toggleYear(y)} />
+                  {y}{y === activeBudgetingYear ? " (active)" : ""}
+                </label>
+              ))}
+            </div>
+          </div>
+          <button onClick={handleGenerate} disabled={generating} style={styles.primaryBtn}>{generating ? "Generating…" : "Generate"}</button>
+        </div>
+        {lastResult && (
+          <div style={{ fontSize: 11.5, color: "#6B6B6B" }}>
+            {lastResult.map(r => <div key={r.year}>{r.year}: {r.vendorsWritten} vendors{r.regionsWritten != null ? `, ${r.regionsWritten} regions` : ""} → {r.target}</div>)}
+          </div>
+        )}
+      </div>
+
       <div style={styles.panel}>
         <div style={styles.panelTitle}>Saved Budget Versions</div>
         <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>Versions are shared across everyone using this tool. Save a snapshot before making major edits so it can be recalled later.</div>
@@ -988,39 +4305,209 @@ function VersionsTab({ versions, onLoad, onSaveClick }) {
   );
 }
 
-function ChatPanel({ messages, input, setInput, onSend, loading, pendingDiff, onConfirm, onCancel, chatEndRef, onClose }) {
+function ChatPanel({ messages, input, setInput, onSend, onStop, loading, pendingDiff, onConfirm, onCancel, chatEndRef, onClose, width, onStartResize, minimized, onToggleMinimize, maximized, onToggleMaximize, onEditMessage, onNewChat }) {
+  const { unit } = useNumberUnit();
   return (
-    <aside style={styles.chatPanel}>
-      <div style={styles.chatHeader}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Sparkles size={15} color="#C00000" /><span style={{ fontWeight: 600, fontSize: 13.5 }}>Budget Assistant</span></div>
-        <button onClick={onClose} style={styles.iconBtnGhost}><X size={15} /></button>
-      </div>
-      <div style={styles.chatBody}>
-        {messages.map((m, i) => (
-          <div key={i} style={{ ...styles.chatBubbleWrap, justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-            {m.type === "diff" && pendingDiff ? (<DiffCard diff={pendingDiff} onConfirm={onConfirm} onCancel={onCancel} />) :
-              (<div style={{ ...styles.chatBubble, ...(m.role === "user" ? styles.chatBubbleUser : styles.chatBubbleAssistant) }}>{m.text}</div>)}
+    <aside style={{ ...styles.chatPanel, width, position: "relative", height: "100%" }}>
+      {/* Drag handle — grab the left edge to resize. Full-height, thin
+          hit-target; only active (col-resize cursor) when not minimized,
+          since there's nothing to drag from a collapsed strip. */}
+      {!minimized && (
+        <div
+          onMouseDown={onStartResize}
+          style={{ position: "absolute", left: -3, top: 0, bottom: 0, width: 6, cursor: "col-resize", zIndex: 5 }}
+          title="Drag to resize"
+        />
+      )}
+
+      {minimized ? (
+        // Collapsed strip — just enough to reopen; full chat body/input
+        // hidden since there's no room to use them at this width.
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 14, gap: 10, height: "100%" }}>
+          <button onClick={onToggleMinimize} style={styles.iconBtnGhost} title="Restore chat"><ChevronLeft size={16} /></button>
+          <Sparkles size={15} color="#C00000" />
+        </div>
+      ) : (
+        <>
+          <div style={{ ...styles.chatHeader, flexWrap: "nowrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <Sparkles size={15} color="#C00000" style={{ flexShrink: 0 }} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 13.5, lineHeight: 1.2, whiteSpace: "nowrap" }}>Sir Slice-a-Lot</div>
+                <div style={{ fontSize: 10, color: "#8A8A8A", lineHeight: 1.2, whiteSpace: "nowrap" }}>Slice. Interpret. Report.</div>
+              </div>
+            </div>
+            {/* No M/K/Full toggle here — it lives once in the top bar and
+                controls everything, including this chat, via shared context. */}
+            <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+              <button
+                onClick={() => { if (messages.length > 1 && !window.confirm("Start a new chat? This clears the current conversation.")) return; onNewChat(); }}
+                style={{ ...styles.iconBtnGhost, fontSize: 16, fontWeight: 600, lineHeight: 1 }} title="New chat — clears the conversation (also keeps token usage down on long threads)"
+              >
+                +
+              </button>
+              <button onClick={onToggleMinimize} style={styles.iconBtnGhost} title="Minimize"><Minus size={14} /></button>
+              <button onClick={onToggleMaximize} style={styles.iconBtnGhost} title={maximized ? "Restore size" : "Maximize"}>
+                {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+              </button>
+              <button onClick={onClose} style={styles.iconBtnGhost} title="Close"><X size={15} /></button>
+            </div>
           </div>
-        ))}
-        {loading && (<div style={styles.chatBubbleWrap}><div style={{ ...styles.chatBubble, ...styles.chatBubbleAssistant, display: "flex", alignItems: "center", gap: 6 }}><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> thinking…</div></div>)}
-        <div ref={chatEndRef} />
-      </div>
-      <div style={styles.chatInputRow}>
-        <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") onSend(); }} placeholder="e.g. set Crowdstrike to 40M" style={styles.chatInput} />
-        <button onClick={onSend} style={styles.chatSendBtn} disabled={loading}><Send size={15} /></button>
-      </div>
+          <div style={styles.chatBody}>
+            {messages.map((m, i) => (
+              <div key={i} className={m.role === "user" ? "chat-msg-user" : undefined} style={{ ...styles.chatBubbleWrap, justifyContent: m.role === "user" ? "flex-end" : "flex-start", position: "relative" }}>
+                {m.role === "user" && onEditMessage && (
+                  <button
+                    onClick={() => onEditMessage(i)}
+                    className="chat-edit-btn"
+                    style={{ ...styles.iconBtnGhost, width: 22, height: 22, alignSelf: "center", opacity: 0, transition: "opacity .12s" }}
+                    title="Edit and resubmit"
+                  >
+                    <Sliders size={11} />
+                  </button>
+                )}
+                {m.type === "diff" && pendingDiff ? (<DiffCard diff={pendingDiff} onConfirm={onConfirm} onCancel={onCancel} />) :
+                  m.type === "table" ? (<TableMessage table={m.table} text={m.text} numberUnit={unit} />) :
+                  (<div style={{ ...styles.chatBubble, ...(m.role === "user" ? styles.chatBubbleUser : styles.chatBubbleAssistant) }}>{reformatNumbersInText(m.text, unit)}</div>)}
+              </div>
+            ))}
+            {loading && (<div style={styles.chatBubbleWrap}><div style={{ ...styles.chatBubble, ...styles.chatBubbleAssistant, display: "flex", alignItems: "center", gap: 6 }}><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> thinking…</div></div>)}
+            <div ref={chatEndRef} />
+          </div>
+          <div style={{ ...styles.chatInputRow, alignItems: "flex-end" }}>
+            <textarea
+              value={input} onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }}
+              placeholder="e.g. set Crowdstrike to 40M (Shift+Enter for a new line)"
+              rows={3}
+              style={styles.chatTextarea}
+            />
+            {loading ? (
+              <button onClick={onStop} style={{ ...styles.chatSendBtn, background: "#6B6B6B" }} title="Stop"><X size={15} /></button>
+            ) : (
+              <button onClick={onSend} style={styles.chatSendBtn} disabled={!input.trim()}><Send size={15} /></button>
+            )}
+          </div>
+        </>
+      )}
     </aside>
   );
 }
 
+// Infers a column's number type from its header text, since the model
+// gives no other signal — a column literally called "Invoice Count" or
+// "Variance %" should never get $ formatting, only real currency columns
+// (Revenue, GP, Budget, Amount, etc.) should.
+function getColumnFormatType(header) {
+  const h = String(header || "").toLowerCase();
+  if (h.includes("%")) return "percent";
+  if (h.includes("count") || h === "invoices" || h === "qty" || h === "quantity") return "count";
+  return "currency";
+}
+// Chart Y-axis width needs to scale with the number format — "Full" mode
+// numbers ($27,653,566) are far longer than "M" mode ones ($27.65M) and
+// were getting clipped against a fixed width tuned only for millions.
+// Finds large numbers embedded in prose (the model is instructed to write
+// raw unformatted numbers even in sentences, same as table cells) and
+// reformats them per the current M/K/Full unit — extends that formatting
+// beyond table cells into chat message text, so "revenue is 27701202"
+// renders as "$27.70M" consistently with the rest of the app.
+function reformatNumbersInText(text, unit) {
+  if (!text) return text;
+  return text.replace(/\$?-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|\$?-?\d{4,}(?:\.\d+)?/g, (match) => {
+    const hadDollar = match.includes("$");
+    const numStr = match.replace(/[$,]/g, "");
+    const num = Number(numStr);
+    if (isNaN(num)) return match;
+    // A bare 4-digit number with no comma/decimal/$ that looks like a
+    // calendar year (1900-2099) is almost certainly a year reference
+    // ("in 2026"), not a dollar figure — leave it alone.
+    if (!hadDollar && !match.includes(",") && !match.includes(".") && num >= 1900 && num <= 2099) return match;
+    return fmtByUnit(num, unit);
+  });
+}
+
+function yAxisWidthForUnit(unit) {
+  if (unit === "full") return 92;
+  if (unit === "thousands") return 76;
+  return 64; // millions
+}
+
+function formatTableCell(value, header, numberUnit) {
+  if (typeof value !== "number") return value;
+  const type = getColumnFormatType(header);
+  if (type === "percent") return `${value.toFixed(1)}%`;
+  if (type === "count") return value.toLocaleString("en-US");
+  return fmtByUnit(value, numberUnit);
+}
+
+function TableMessage({ table, text, numberUnit }) {
+  const columns = table?.columns || [];
+  const rows = table?.rows || [];
+  // Auto-totals: sum every column that's fully numeric across all rows,
+  // except percent/count columns — summing a % column isn't meaningful,
+  // and a "totaled" invoice count across a breakdown is often misleading
+  // too (double-counts rows that could belong to multiple groups), so
+  // both are skipped the same way. Skipped entirely for single-row
+  // tables, where a totals row would just repeat the one row.
+  const totals = rows.length > 1 ? columns.map((c, ci) => {
+    if (ci === 0) return "Total";
+    if (getColumnFormatType(c) !== "currency") return null;
+    const allNumeric = rows.every(r => typeof r[ci] === "number");
+    return allNumeric ? rows.reduce((s, r) => s + (r[ci] || 0), 0) : null;
+  }) : null;
+  const showTotals = totals && totals.some((t, ci) => ci > 0 && t !== null);
+
+  return (
+    <div style={{ ...styles.chatBubble, ...styles.chatBubbleAssistant, width: "100%", maxWidth: "100%", padding: 12 }}>
+      {table?.title && <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 8 }}>{table.title}</div>}
+      <div style={styles.tableScroll}>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11.5 }}>
+          <thead>
+            <tr>
+              {columns.map((c, i) => (
+                <th key={i} style={{ textAlign: i === 0 ? "left" : "right", padding: "3px 7px", borderBottom: "1px solid #E0E0E0", color: "#6B6B6B", fontWeight: 600, whiteSpace: "nowrap" }}>{c}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, ri) => (
+              <tr key={ri}>
+                {row.map((cell, ci) => (
+                  <td key={ci} className={ci > 0 ? "num" : undefined} style={{ textAlign: ci === 0 ? "left" : "right", padding: "3px 7px", borderBottom: "1px solid #F0F0F0", whiteSpace: "nowrap" }}>
+                    {formatTableCell(cell, columns[ci], numberUnit)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+          {showTotals && (
+            <tfoot>
+              <tr style={{ borderTop: "2px solid #111111" }}>
+                {totals.map((t, ci) => (
+                  <td key={ci} className={ci > 0 ? "num" : undefined} style={{ textAlign: ci === 0 ? "left" : "right", padding: "3px 7px", fontWeight: 700, whiteSpace: "nowrap" }}>
+                    {t === null ? "" : (ci === 0 ? t : formatTableCell(t, columns[ci], numberUnit))}
+                  </td>
+                ))}
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+      {text && <div style={{ marginTop: 9, fontSize: 12.5 }}>{reformatNumbersInText(text, numberUnit)}</div>}
+    </div>
+  );
+}
+
 function DiffCard({ diff, onConfirm, onCancel }) {
+  const { fmtN, unit } = useNumberUnit();
   const revUp = diff.newRevenue >= diff.oldRevenue;
   return (
     <div style={styles.diffCard}>
       <div style={{ fontSize: 11, color: "#6B6B6B", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.04em" }}>Proposed change · {diff.vendor}</div>
-      {diff.explanation && <div style={{ fontSize: 12.5, color: "#333333", marginBottom: 10 }}>{diff.explanation}</div>}
-      <div className="num" style={styles.diffLine}><span style={styles.diffOld}>{fmtCompact(diff.oldRevenue)}</span><span style={{ margin: "0 8px", color: "#6B6B6B" }}>→</span><span style={{ color: revUp ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtCompact(diff.newRevenue)}</span><span style={{ marginLeft: 8, fontSize: 11, color: "#6B6B6B" }}>revenue</span></div>
-      <div className="num" style={{ ...styles.diffLine, marginTop: 4 }}><span style={styles.diffOld}>{fmtCompact(diff.oldGp)}</span><span style={{ margin: "0 8px", color: "#6B6B6B" }}>→</span><span style={{ color: "#333333", fontWeight: 600 }}>{fmtCompact(diff.newGp)}</span><span style={{ marginLeft: 8, fontSize: 11, color: "#6B6B6B" }}>GP (auto-scaled)</span></div>
+      {diff.explanation && <div style={{ fontSize: 12.5, color: "#333333", marginBottom: 10 }}>{reformatNumbersInText(diff.explanation, unit)}</div>}
+      <div className="num" style={styles.diffLine}><span style={styles.diffOld}>{fmtN(diff.oldRevenue)}</span><span style={{ margin: "0 8px", color: "#6B6B6B" }}>→</span><span style={{ color: revUp ? "#1B8A3A" : "#C00000", fontWeight: 600 }}>{fmtN(diff.newRevenue)}</span><span style={{ marginLeft: 8, fontSize: 11, color: "#6B6B6B" }}>revenue</span></div>
+      <div className="num" style={{ ...styles.diffLine, marginTop: 4 }}><span style={styles.diffOld}>{fmtN(diff.oldGp)}</span><span style={{ margin: "0 8px", color: "#6B6B6B" }}>→</span><span style={{ color: "#333333", fontWeight: 600 }}>{fmtN(diff.newGp)}</span><span style={{ marginLeft: 8, fontSize: 11, color: "#6B6B6B" }}>GP (auto-scaled)</span></div>
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
         <button onClick={onConfirm} style={styles.diffConfirmBtn}><Check size={13} style={{ marginRight: 4 }} />Apply</button>
         <button onClick={onCancel} style={styles.diffCancelBtn}><X size={13} style={{ marginRight: 4 }} />Discard</button>
@@ -1033,7 +4520,10 @@ function SaveModal({ versionName, setVersionName, onCancel, onSave }) {
   return (
     <div style={styles.modalOverlay} onClick={onCancel}>
       <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
-        <div style={{ fontWeight: 600, fontSize: 16, marginBottom: 4 }}>Save budget version</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>Save budget version</div>
+          <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
         <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>Visible to everyone using this tool.</div>
         <input autoFocus value={versionName} onChange={(e) => setVersionName(e.target.value)} placeholder="e.g. Q3 Board Review" style={styles.modalInput} onKeyDown={(e) => { if (e.key === "Enter") onSave(); }} />
         <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
@@ -1047,22 +4537,124 @@ function SaveModal({ versionName, setVersionName, onCancel, onSave }) {
 
 /* ============================= VENDOR PLANNER MODAL ============================= */
 
-function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
+function VendorHistoryPanel({ history, loading }) {
+  const { fmtN } = useNumberUnit();
+  if (loading) return <div style={{ padding: "10px 0", fontSize: 12.5, color: "#6B6B6B" }}>Loading vendor history…</div>;
+  if (!history) return null;
+  const { years, tier, buHead } = history;
+  const hasAnyData = years.some(y => y.budget_revenue || y.actual_revenue);
+
+  return (
+    <div style={{ background: "#F7F7F5", border: "1px solid #E0E0E0", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+      <div style={{ display: "flex", gap: 18, marginBottom: 12, fontSize: 12.5 }}>
+        <div><span style={{ color: "#6B6B6B" }}>Tier: </span><strong>{tier || "—"}</strong></div>
+        <div><span style={{ color: "#6B6B6B" }}>BU Head: </span><strong>{buHead || "—"}</strong></div>
+      </div>
+
+      {!hasAnyData ? (
+        <div style={{ fontSize: 12, color: "#6B6B6B" }}>No prior-year history found for this vendor — likely a new vendor.</div>
+      ) : (
+        <>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 14 }}>
+            <thead>
+              <tr>
+                <th style={styles.historyTh}>Year</th>
+                <th style={{ ...styles.historyTh, textAlign: "right" }}>Budget Rev</th>
+                <th style={{ ...styles.historyTh, textAlign: "right" }}>Actual Rev</th>
+                <th style={{ ...styles.historyTh, textAlign: "right" }}>% Achievement</th>
+              </tr>
+            </thead>
+            <tbody>
+              {years.map(y => (
+                <tr key={y.year}>
+                  <td style={styles.historyTd}>{y.year}</td>
+                  <td className="num" style={{ ...styles.historyTd, textAlign: "right" }}>{fmtN(y.budget_revenue)}</td>
+                  <td className="num" style={{ ...styles.historyTd, textAlign: "right" }}>{fmtN(y.actual_revenue)}</td>
+                  <td className="num" style={{ ...styles.historyTd, textAlign: "right", color: y.achievement_pct === null ? "#6B6B6B" : (y.achievement_pct >= 1 ? "#1B8A3A" : "#C00000") }}>
+                    {y.achievement_pct === null ? "—" : fmtPct(y.achievement_pct)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+        </>
+      )}
+    </div>
+  );
+}
+
+function VendorPlannerModal({ vendor, onClose, onApply, callClaude, year }) {
+  const { fmtN } = useNumberUnit();
   const [fyRevenue, setFyRevenue] = useState(String(Math.round(vendor.budget_revenue)));
   const [gpPct, setGpPct] = useState(String((vendor.gp_pct * 100).toFixed(1)));
   const [candidates] = useState(() => buildVendorCandidates(vendor));
   const [selectedKey, setSelectedKey] = useState(candidates.find(c => c.recommended)?.key || candidates[0]?.key);
-  const [expandedKey, setExpandedKey] = useState(null);
   const [customCellsPct, setCustomCellsPct] = useState(null); // overrides selected candidate once user edits
-  const [mode, setMode] = useState("pick"); // "pick" | "custom"
+  const [mode, setMode] = useState("pick"); // "pick" | "custom" | "buhead"
   const [assistInput, setAssistInput] = useState("");
   const [assistLoading, setAssistLoading] = useState(false);
   const [assistLog, setAssistLog] = useState([]);
 
+  // Item 4 — last-3-years performance + region/month linearity, so
+  // management sees real history before setting next year's number.
+  const [history, setHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setHistoryLoading(true);
+    getVendorHistory(vendor.vendor, year)
+      .then(h => { if (!cancelled) setHistory(h); })
+      .catch(() => { if (!cancelled) setHistory(null); })
+      .finally(() => { if (!cancelled) setHistoryLoading(false); });
+    return () => { cancelled = true; };
+  }, [vendor.vendor, year]);
+
   const revenueNum = parseFloat(fyRevenue.replace(/[^0-9.]/g, "")) || 0;
   const gpPctNum = (parseFloat(gpPct) || 0) / 100;
 
-  const activeCellsPct = customCellsPct || (candidates.find(c => c.key === selectedKey)?.cellsPct) || {};
+  // "BU Head Update" — manual entry mode. The BU head supplies two simple 1-D
+  // distributions (region % of year, month % of year) instead of a full
+  // month×country grid; the grid is derived by crossing them (cell =
+  // monthPct × regionPct), same independence assumption the historical
+  // candidates don't need (they have real 2-D data) but a manual estimate
+  // reasonably can. Seeded from the Blended candidate as a starting point
+  // so the BU head is adjusting real numbers, not typing from scratch.
+  const blendedCandidate = candidates.find(c => c.key === "blended") || candidates[candidates.length - 1];
+  const [buHeadMonthPct, setBuHeadMonthPct] = useState(() => {
+    const mp = blendedCandidate ? monthMarginal(blendedCandidate.cellsPct) : {};
+    return Object.fromEntries(MONTHS.map((_, i) => [i + 1, mp[i + 1] ? (mp[i + 1] * 100).toFixed(1) : ""]));
+  });
+  const [buHeadRegionPct, setBuHeadRegionPct] = useState(() => {
+    const cp = blendedCandidate ? countryMarginal(blendedCandidate.cellsPct) : {};
+    return Object.fromEntries(Object.entries(cp).map(([c, p]) => [c, (p * 100).toFixed(1)]));
+  });
+  const [newRegionName, setNewRegionName] = useState("");
+  const buHeadMonthSum = Object.values(buHeadMonthPct).reduce((s, v) => s + (parseFloat(v) || 0), 0);
+  const buHeadRegionSum = Object.values(buHeadRegionPct).reduce((s, v) => s + (parseFloat(v) || 0), 0);
+  const buHeadCellsPct = useMemo(() => {
+    const monthTotal = buHeadMonthSum || 1; // normalize even if not exactly 100 — sum indicator flags the mismatch, doesn't block preview
+    const regionTotal = buHeadRegionSum || 1;
+    const cells = {};
+    for (const m in buHeadMonthPct) {
+      const mp = (parseFloat(buHeadMonthPct[m]) || 0) / monthTotal;
+      for (const c in buHeadRegionPct) {
+        const cp = (parseFloat(buHeadRegionPct[c]) || 0) / regionTotal;
+        cells[`${m}|${c}`] = mp * cp;
+      }
+    }
+    return cells;
+  }, [buHeadMonthPct, buHeadRegionPct, buHeadMonthSum, buHeadRegionSum]);
+  const updateRegionPct = (region, val) => setBuHeadRegionPct(prev => ({ ...prev, [region]: val }));
+  const removeRegionRow = (region) => setBuHeadRegionPct(prev => { const n = { ...prev }; delete n[region]; return n; });
+  const addRegionRow = () => {
+    const name = newRegionName.trim();
+    if (!name || buHeadRegionPct[name] !== undefined) return;
+    setBuHeadRegionPct(prev => ({ ...prev, [name]: "0" }));
+    setNewRegionName("");
+  };
+
+  const activeCellsPct = mode === "buhead" ? buHeadCellsPct : (customCellsPct || (candidates.find(c => c.key === selectedKey)?.cellsPct) || {});
   const grid = useMemo(() => gridFromPct(activeCellsPct, revenueNum), [activeCellsPct, revenueNum]);
   const countryTotals = useMemo(() => {
     const out = {};
@@ -1080,6 +4672,13 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
     for (const m in grid) for (const c in grid[m]) mx = Math.max(mx, grid[m][c]);
     return mx;
   }, [grid]);
+
+  // Same invariant FullGrid checks (grid total should always equal
+  // revenueNum, by construction of gridFromPct + the normalized cellsPct
+  // sources) — gating Apply here too so a mismatch can't be silently
+  // applied, not just passively warned about.
+  const gridGrandTotal = countryTotals.reduce((s, [, v]) => s + v, 0);
+  const gridMismatch = Math.abs(gridGrandTotal - revenueNum) > Math.max(1, revenueNum * 0.001);
 
   const selectCandidate = (key) => { setSelectedKey(key); setCustomCellsPct(null); setMode("pick"); };
 
@@ -1152,6 +4751,8 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
           <button onClick={onClose} style={styles.iconBtnGhost}><X size={16} /></button>
         </div>
 
+        <VendorHistoryPanel history={history} loading={historyLoading} />
+
         <div style={styles.plannerInputsRow}>
           <div style={styles.plannerInputGroup}>
             <label style={styles.plannerLabel}>FY Revenue</label>
@@ -1163,7 +4764,7 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
           </div>
           <div style={{ ...styles.plannerInputGroup, flex: 1 }}>
             <label style={styles.plannerLabel}>Implied GP</label>
-            <div className="num" style={{ ...styles.plannerInput, background: "transparent", border: "1px dashed #E0E0E0", color: "#6B6B6B" }}>{fmtCompact(revenueNum * gpPctNum)}</div>
+            <div className="num" style={{ ...styles.plannerInput, background: "transparent", border: "1px dashed #E0E0E0", color: "#6B6B6B" }}>{fmtN(revenueNum * gpPctNum)}</div>
           </div>
         </div>
 
@@ -1171,12 +4772,13 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
           <div style={{ fontSize: 12, fontWeight: 600, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em", margin: "14px 0 8px" }}>Choose a linearity source</div>
           <div style={styles.candidateGrid}>
             {candidates.map(c => (
-              <CandidateCard
-                key={c.key} candidate={c} selected={mode === "pick" && selectedKey === c.key}
-                revenueNum={revenueNum} onSelect={() => selectCandidate(c.key)}
-                expanded={expandedKey === c.key} onToggleExpand={() => setExpandedKey(k => k === c.key ? null : c.key)}
-              />
+              <CandidateCard key={c.key} candidate={c} selected={mode === "pick" && selectedKey === c.key} onSelect={() => selectCandidate(c.key)} />
             ))}
+            <div onClick={() => setMode("buhead")} style={{ ...styles.candidateCard, ...(mode === "buhead" ? styles.candidateCardSelected : {}), display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+              <Terminal size={18} color="#111111" />
+              <div style={{ fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>BU Head Update</div>
+              <div style={{ fontSize: 10.5, color: "#6B6B6B", marginTop: 2, textAlign: "center" }}>Manually enter region % and month %</div>
+            </div>
             <div onClick={() => setMode("custom")} style={{ ...styles.candidateCard, ...(mode === "custom" ? styles.candidateCardSelected : {}), display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
               <Wand2 size={18} color="#111111" />
               <div style={{ fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Custom</div>
@@ -1184,13 +4786,52 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
             </div>
           </div>
 
+          {mode === "buhead" && (
+            <div style={{ ...styles.assistBox, marginTop: 12 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 10 }}>
+                Enter the BU head's estimated split — each column should sum to 100%. The grid preview below updates live.
+              </div>
+              <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 4 }}>
+                    <span>MONTH %</span>
+                    <span style={{ color: Math.abs(buHeadMonthSum - 100) < 0.5 ? "#1B8A3A" : "#C00000" }}>{buHeadMonthSum.toFixed(1)}%</span>
+                  </div>
+                  {MONTHS.map((mn, i) => (
+                    <div key={mn} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                      <span style={{ fontSize: 11, width: 30 }}>{mn}</span>
+                      <input className="num" value={buHeadMonthPct[i + 1]} onChange={(e) => setBuHeadMonthPct(prev => ({ ...prev, [i + 1]: e.target.value }))} style={{ ...styles.gridCellInput, width: 56, position: "static" }} placeholder="0" />
+                    </div>
+                  ))}
+                </div>
+                <div style={{ minWidth: 180 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 4 }}>
+                    <span>REGION %</span>
+                    <span style={{ color: Math.abs(buHeadRegionSum - 100) < 0.5 ? "#1B8A3A" : "#C00000" }}>{buHeadRegionSum.toFixed(1)}%</span>
+                  </div>
+                  {Object.keys(buHeadRegionPct).map(region => (
+                    <div key={region} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                      <span style={{ fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{region}</span>
+                      <input className="num" value={buHeadRegionPct[region]} onChange={(e) => updateRegionPct(region, e.target.value)} style={{ ...styles.gridCellInput, width: 56, position: "static" }} placeholder="0" />
+                      <button onClick={() => removeRegionRow(region)} style={{ ...styles.iconBtnGhost, width: 20, height: 20 }} title={`Remove ${region}`}><X size={11} /></button>
+                    </div>
+                  ))}
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <input value={newRegionName} onChange={(e) => setNewRegionName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRegionRow(); }} placeholder="Add region…" style={{ ...styles.chatInput, background: "#FFFFFF", fontSize: 11.5, padding: "5px 8px" }} />
+                    <button onClick={addRegionRow} style={styles.secondaryBtn}>Add</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "18px 0 8px" }}>
             <Grid3x3 size={14} color="#6B6B6B" />
             <div style={{ fontSize: 12, fontWeight: 600, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em" }}>
               {mode === "custom" ? "Custom grid — click any cell to edit" : "Applied grid preview"}
             </div>
           </div>
-          <FullGrid grid={grid} countryList={countryList} maxCell={maxCell} editable={mode === "custom"} onEditCell={editCell} />
+          <FullGrid grid={grid} countryList={countryList} maxCell={maxCell} editable={mode === "custom"} onEditCell={editCell} targetRevenue={revenueNum} />
 
           {mode === "custom" && (
             <div style={styles.assistBox}>
@@ -1209,10 +4850,10 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
         </div>
 
         <div style={styles.plannerFooter}>
-          <div style={{ fontSize: 12, color: "#6B6B6B" }}>Total: <span className="num" style={{ color: "#111111", fontWeight: 600 }}>{fmtCompact(revenueNum)}</span> · GP: <span className="num" style={{ color: "#111111", fontWeight: 600 }}>{fmtCompact(revenueNum * gpPctNum)}</span></div>
+          <div style={{ fontSize: 12, color: "#6B6B6B" }}>Total: <span className="num" style={{ color: "#111111", fontWeight: 600 }}>{fmtN(revenueNum)}</span> · GP: <span className="num" style={{ color: "#111111", fontWeight: 600 }}>{fmtN(revenueNum * gpPctNum)}</span></div>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={onClose} style={styles.secondaryBtn}>Cancel</button>
-            <button onClick={() => onApply(grid, gpPctNum)} style={styles.primaryBtn}><Check size={14} style={{ marginRight: 6 }} />Apply to Budget</button>
+            <button onClick={() => onApply(grid, gpPctNum)} style={{ ...styles.primaryBtn, ...(gridMismatch ? { opacity: 0.4, cursor: "not-allowed" } : {}) }} disabled={gridMismatch} title={gridMismatch ? "Grid total doesn't match FY Revenue — see the warning above the grid" : undefined}><Check size={14} style={{ marginRight: 6 }} />Apply to Budget</button>
           </div>
         </div>
       </div>
@@ -1220,102 +4861,151 @@ function VendorPlannerModal({ vendor, onClose, onApply, callClaude }) {
   );
 }
 
-function CandidateCard({ candidate, selected, revenueNum, onSelect, expanded, onToggleExpand }) {
+function CandidateCard({ candidate, selected, onSelect }) {
   const countryPct = countryMarginal(candidate.cellsPct);
   const monthPct = monthMarginal(candidate.cellsPct);
-  const topCountries = Object.entries(countryPct).sort((a, b) => b[1] - a[1]).slice(0, 3);
-  const maxMonth = Math.max(0.001, ...Object.values(monthPct));
+  const regionRows = Object.entries(countryPct).sort((a, b) => b[1] - a[1]);
   return (
-    <div style={{ ...styles.candidateCard, ...(selected ? styles.candidateCardSelected : {}) }}>
-      <div onClick={onSelect} style={{ cursor: "pointer" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ fontSize: 12.5, fontWeight: 600 }}>{candidate.label}</div>
-          {selected && <Check size={13} color="#C00000" />}
+    <div onClick={onSelect} style={{ ...styles.candidateCard, ...(selected ? styles.candidateCardSelected : {}), cursor: "pointer" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 600 }}>{candidate.label}</div>
+        {selected && <Check size={13} color="#C00000" />}
+      </div>
+      <div style={{ display: "flex", gap: 16 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 9.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 3 }}>REGION %</div>
+          {regionRows.map(([c, p]) => (
+            <div key={c} style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, padding: "1px 0" }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c}</span>
+              <span className="num" style={{ flexShrink: 0, marginLeft: 6 }}>{fmtPct1(p)}</span>
+            </div>
+          ))}
         </div>
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 28, marginTop: 8 }}>
-          {MONTHS.map((_, i) => {
-            const p = monthPct[i + 1] || 0;
-            return <div key={i} style={{ flex: 1, height: `${Math.max(3, (p / maxMonth) * 100)}%`, background: selected ? "#C00000" : "#D0D0D0", borderRadius: 1 }} />;
-          })}
-        </div>
-        <div style={{ marginTop: 8, fontSize: 10.5, color: "#6B6B6B", lineHeight: 1.6 }}>
-          {topCountries.map(([c, p]) => <div key={c}>{c} · {fmtPct1(p)}</div>)}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 9.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 3 }}>MONTH %</div>
+          {MONTHS.map((mn, i) => (
+            <div key={mn} style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, padding: "1px 0" }}>
+              <span>{mn}</span>
+              <span className="num">{fmtPct1(monthPct[i + 1] || 0)}</span>
+            </div>
+          ))}
         </div>
       </div>
-      <button onClick={onToggleExpand} style={styles.expandBtn}>
-        {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />} {expanded ? "Hide" : "View"} full grid
-      </button>
-      {expanded && (
-        <div style={{ marginTop: 8 }}>
-          <FullGrid grid={gridFromPct(candidate.cellsPct, revenueNum)} countryList={Object.keys(countryPct).sort((a, b) => countryPct[b] - countryPct[a])} maxCell={Math.max(1, ...Object.values(gridFromPct(candidate.cellsPct, revenueNum)).flatMap(o => Object.values(o)))} compact />
+    </div>
+  );
+}
+
+function FullGrid({ grid, countryList, maxCell, editable, onEditCell, compact, targetRevenue }) {
+  const { fmtN } = useNumberUnit();
+  const [editing, setEditing] = useState(null); // "m|c"
+  const [editVal, setEditVal] = useState("");
+  const cellSize = compact ? 46 : 68;
+
+  const rowTotals = MONTHS.map((_, i) => {
+    const m = i + 1;
+    return grid[m] ? countryList.reduce((s, c) => s + (grid[m][c] || 0), 0) : 0;
+  });
+  const colTotals = countryList.map(c => {
+    let s = 0;
+    for (const m in grid) s += grid[m][c] || 0;
+    return s;
+  });
+  const grandTotal = rowTotals.reduce((a, b) => a + b, 0);
+  // Structurally this should always match (grids are built from cellsPct
+  // that's normalized to sum to 1, and every edit path recomputes/resyncs
+  // fyRevenue to the new total) — this is a safety net for that
+  // invariant, not an expected everyday warning. Tolerance covers floating
+  // point rounding, not real discrepancies.
+  const tolerance = Math.max(1, (targetRevenue || 0) * 0.001);
+  const mismatch = targetRevenue !== undefined && Math.abs(grandTotal - targetRevenue) > tolerance;
+
+  return (
+    <div>
+      <div style={{ overflowX: "auto", border: "1px solid #E0E0E0", borderRadius: 8 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: compact ? 10 : 11.5 }}>
+          <thead>
+            <tr>
+              <th style={{ ...styles.gridHeadCell, textAlign: "left", position: "sticky", left: 0, background: "#FFFFFF", zIndex: 1 }}>Month</th>
+              {countryList.map(c => <th key={c} style={{ ...styles.gridHeadCell, minWidth: cellSize + 20 }}>{c}</th>)}
+              <th style={{ ...styles.gridHeadCell, minWidth: cellSize + 20, fontWeight: 700, borderLeft: "2px solid #E0E0E0" }}>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {MONTHS.map((mn, i) => {
+              const m = i + 1;
+              return (
+                <tr key={m}>
+                  <td style={{ ...styles.gridRowLabel, position: "sticky", left: 0, background: "#FFFFFF" }}>{mn}</td>
+                  {countryList.map(c => {
+                    const v = (grid[m] && grid[m][c]) || 0;
+                    const intensity = Math.min(1, v / maxCell);
+                    const key = `${m}|${c}`;
+                    const isEditing = editing === key;
+                    return (
+                      <td key={c} style={{ ...styles.gridCell, background: `rgba(192,0,0,${0.06 + intensity * 0.28})` }}
+                        onClick={() => { if (editable) { setEditing(key); setEditVal(String(Math.round(v))); } }}>
+                        {isEditing ? (
+                          <input autoFocus className="num" value={editVal} onChange={(e) => setEditVal(e.target.value)}
+                            onBlur={() => { onEditCell(m, c, editVal); setEditing(null); }}
+                            onKeyDown={(e) => { if (e.key === "Enter") { onEditCell(m, c, editVal); setEditing(null); } if (e.key === "Escape") setEditing(null); }}
+                            style={styles.gridCellInput} />
+                        ) : (<span className="num">{v >= 1000 ? fmtN(v) : v > 0 ? `$${Math.round(v)}` : "—"}</span>)}
+                      </td>
+                    );
+                  })}
+                  <td className="num" style={{ ...styles.gridCell, fontWeight: 700, borderLeft: "2px solid #E0E0E0", background: "#F7F7F5" }}>
+                    {rowTotals[i] > 0 ? fmtN(rowTotals[i]) : "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+          <tfoot>
+            <tr style={{ borderTop: "2px solid #111111" }}>
+              <td style={{ ...styles.gridRowLabel, position: "sticky", left: 0, background: "#FFFFFF", fontWeight: 700 }}>Total</td>
+              {colTotals.map((t, i) => (
+                <td key={countryList[i]} className="num" style={{ ...styles.gridCell, fontWeight: 700, background: "#F7F7F5" }}>{t > 0 ? fmtN(t) : "—"}</td>
+              ))}
+              <td className="num" style={{ ...styles.gridCell, fontWeight: 700, borderLeft: "2px solid #E0E0E0", background: "#EDEDED" }}>{fmtN(grandTotal)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      {mismatch && (
+        <div style={{ marginTop: 8, fontSize: 12, color: "#C00000", background: "#FFF0F0", border: "1px solid #F0C0C0", borderRadius: 6, padding: "6px 10px" }}>
+          ⚠ Grid total ({fmtN(grandTotal)}) doesn't match the FY Revenue field ({fmtN(targetRevenue)}) — off by {fmtN(Math.abs(grandTotal - targetRevenue))}. This shouldn't normally happen; check for a rounding issue before applying.
         </div>
       )}
     </div>
   );
 }
 
-function FullGrid({ grid, countryList, maxCell, editable, onEditCell, compact }) {
-  const [editing, setEditing] = useState(null); // "m|c"
-  const [editVal, setEditVal] = useState("");
-  const cellSize = compact ? 46 : 68;
-  return (
-    <div style={{ overflowX: "auto", border: "1px solid #E0E0E0", borderRadius: 8 }}>
-      <table style={{ borderCollapse: "collapse", width: "100%", fontSize: compact ? 10 : 11.5 }}>
-        <thead>
-          <tr>
-            <th style={{ ...styles.gridHeadCell, textAlign: "left", position: "sticky", left: 0, background: "#FFFFFF", zIndex: 1 }}>Month</th>
-            {countryList.map(c => <th key={c} style={{ ...styles.gridHeadCell, minWidth: cellSize + 20 }}>{c}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {MONTHS.map((mn, i) => {
-            const m = i + 1;
-            return (
-              <tr key={m}>
-                <td style={{ ...styles.gridRowLabel, position: "sticky", left: 0, background: "#FFFFFF" }}>{mn}</td>
-                {countryList.map(c => {
-                  const v = (grid[m] && grid[m][c]) || 0;
-                  const intensity = Math.min(1, v / maxCell);
-                  const key = `${m}|${c}`;
-                  const isEditing = editing === key;
-                  return (
-                    <td key={c} style={{ ...styles.gridCell, background: `rgba(192,0,0,${0.06 + intensity * 0.28})` }}
-                      onClick={() => { if (editable) { setEditing(key); setEditVal(String(Math.round(v))); } }}>
-                      {isEditing ? (
-                        <input autoFocus className="num" value={editVal} onChange={(e) => setEditVal(e.target.value)}
-                          onBlur={() => { onEditCell(m, c, editVal); setEditing(null); }}
-                          onKeyDown={(e) => { if (e.key === "Enter") { onEditCell(m, c, editVal); setEditing(null); } if (e.key === "Escape") setEditing(null); }}
-                          style={styles.gridCellInput} />
-                      ) : (<span className="num">{v >= 1000 ? fmtCompact(v) : v > 0 ? `$${Math.round(v)}` : "—"}</span>)}
-                    </td>
-                  );
-                })}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 /* ============================= STYLES ============================= */
 const styles = {
-  appRoot: { fontFamily: "'Inter', sans-serif", background: "#FFFFFF", color: "#111111", minHeight: "100vh", width: "100%" },
+  appRoot: { fontFamily: "'Inter', sans-serif", background: "#FFFFFF", color: "#111111", height: "100vh", width: "100%", display: "flex", flexDirection: "column", overflow: "hidden" },
   topBar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
+  yearRow: { padding: "10px 24px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
   logoMark: { width: 34, height: 34, borderRadius: 8, background: "linear-gradient(135deg, #C00000, #7A0000)", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 14, color: "#FFFFFF" },
   brandTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 17, lineHeight: 1.1 },
   brandSub: { fontSize: 11.5, color: "#6B6B6B", marginTop: 2 },
   scenarioToggle: { display: "flex", background: "#FFFFFF", borderRadius: 8, padding: 3, border: "1px solid #E0E0E0" },
   scenarioBtn: { border: "none", background: "transparent", color: "#6B6B6B", fontSize: 12.5, fontWeight: 600, padding: "6px 12px", borderRadius: 6, cursor: "pointer" },
+  yearSelect: { border: "1px solid #E0E0E0", borderRadius: 7, padding: "6px 10px", fontSize: 12.5, fontWeight: 600, color: "#111111", background: "#FFFFFF", cursor: "pointer" },
+  unitToggle: { display: "flex", border: "1px solid #E0E0E0", borderRadius: 6, overflow: "hidden" },
+  unitToggleBtn: { border: "none", background: "#FFFFFF", color: "#6B6B6B", fontSize: 10.5, fontWeight: 600, padding: "3px 8px", cursor: "pointer" },
+  unitToggleBtnActive: { background: "#111111", color: "#FFFFFF" },
   scenarioBtnActive: { background: "#C00000", color: "#FFFFFF" },
   primaryBtn: { display: "flex", alignItems: "center", background: "#C00000", color: "#FFFFFF", border: "none", borderRadius: 7, padding: "8px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" },
   secondaryBtn: { background: "#F4F4F4", color: "#111111", border: "1px solid #E0E0E0", borderRadius: 7, padding: "8px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" },
   iconBtnGhost: { background: "transparent", border: "1px solid #E0E0E0", color: "#6B6B6B", borderRadius: 7, width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" },
-  body: { display: "flex", alignItems: "stretch", minHeight: "calc(100vh - 65px)" },
+  body: { display: "flex", alignItems: "stretch", flex: 1, minHeight: 0, overflow: "hidden" },
   sidebar: { width: 190, flexShrink: 0, borderRight: "1px solid #E0E0E0", padding: "18px 12px", display: "flex", flexDirection: "column", gap: 4, background: "#FFFFFF" },
-  navItem: { textAlign: "left", background: "transparent", border: "none", color: "#6B6B6B", fontSize: 13.5, fontWeight: 500, padding: "9px 12px", borderRadius: 7, cursor: "pointer" },
-  navItemActive: { background: "#F4F4F4", color: "#111111" },
+  navItem: { display: "flex", alignItems: "center", gap: 10, textAlign: "left", background: "transparent", border: "none", color: "#6B6B6B", fontSize: 13.5, fontWeight: 500, padding: "9px 12px", borderRadius: 8, cursor: "pointer" },
+  // Blush Red — chosen 2026-08-24 from a set of six light-background
+  // options. Bold weight + a solid fill (not just a tint on hover) so the
+  // active tab reads unmistakably, even at a glance; boxShadow (not
+  // border-left) draws the accent bar so it doesn't shift the row's padding.
+  navItemActive: { background: "#F8E3E1", color: "#151414", fontWeight: 700, boxShadow: "inset 3px 0 0 0 #B4231E" },
   sidebarFootnote: { marginTop: "auto", fontSize: 10.5, color: "#8A8A8A", lineHeight: 1.5, padding: "12px" },
   main: { flex: 1, padding: "22px 24px", overflowY: "auto", minWidth: 0 },
   kpiGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 14, marginBottom: 18 },
@@ -1325,13 +5015,30 @@ const styles = {
   kpiSub: { fontSize: 12, marginTop: 6, fontWeight: 500 },
   panel: { background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 12, padding: "18px 20px", marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" },
   panelTitle: { fontSize: 14, fontWeight: 600, marginBottom: 14, fontFamily: "'Fraunces', serif" },
+  panelIconBtn: { border: "1px solid #E0E0E0", background: "#FFFFFF", borderRadius: 6, width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", cursor: "pointer" },
+  historyTh: { textAlign: "left", padding: "4px 8px", borderBottom: "1px solid #E0E0E0", color: "#6B6B6B", fontWeight: 600, fontSize: 11 },
+  historyTd: { padding: "4px 8px", borderBottom: "1px solid #EDEDED" },
   moverRow: { display: "flex", alignItems: "center", gap: 12 },
   tableToolbar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 },
   searchBox: { display: "flex", alignItems: "center", gap: 8, background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, padding: "7px 12px", width: 240 },
   searchInput: { border: "none", background: "transparent", color: "#111111", fontSize: 13, outline: "none", flex: 1 },
   tableHint: { fontSize: 11.5, color: "#8A8A8A" },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
-  th: { padding: "8px 10px", fontSize: 11, color: "#6B6B6B", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.03em", borderBottom: "1px solid #E0E0E0", whiteSpace: "nowrap" },
+  // Bounded-height scroll box, both axes — deliberately NOT just
+  // overflowX:auto: a lone overflow-x implicitly computes overflow-y to
+  // "auto" too (CSS spec quirk) but with no height cap the box never
+  // actually scrolls vertically, so `position:sticky` inside it has
+  // nothing to stick against and silently does nothing. Giving the box a
+  // real maxHeight + explicit overflowY makes it the genuine scrolling
+  // ancestor sticky needs. Applied to every data table in the app.
+  tableScroll: { overflowX: "auto", overflowY: "auto", maxHeight: "65vh" },
+  th: { padding: "8px 10px", fontSize: 11, color: "#6B6B6B", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.03em", borderBottom: "1px solid #E0E0E0", whiteSpace: "nowrap", position: "sticky", top: 0, background: "#FFFFFF", zIndex: 2 },
+  // Sticky first column ("freeze pane") — opt-in per column, not part of
+  // the base th/td styles, since only some tables (Vendors) need it.
+  // Header corner cell (thStickyCol on a <th>) needs the higher zIndex so
+  // it stays above sticky body cells at the top-left intersection.
+  thStickyCol: { position: "sticky", left: 0, zIndex: 3, background: "#FFFFFF" },
+  tdStickyCol: { position: "sticky", left: 0, zIndex: 1, background: "#FFFFFF" },
   tr: { borderBottom: "1px solid #F0F0F0" },
   td: { padding: "9px 10px", textAlign: "right", whiteSpace: "nowrap" },
   editableCell: { cursor: "pointer", borderBottom: "1px dashed #8A8A8A", paddingBottom: 1 },
@@ -1341,7 +5048,7 @@ const styles = {
   planBtn: { display: "inline-flex", alignItems: "center", background: "#F4F4F4", color: "#333333", border: "1px solid #E0E0E0", borderRadius: 6, padding: "5px 9px", fontSize: 11.5, fontWeight: 600, cursor: "pointer" },
   plannedDot: { display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#C00000", marginLeft: 7, verticalAlign: "middle" },
   chatFab: { position: "fixed", bottom: 22, right: 22, width: 50, height: 50, borderRadius: "50%", background: "#C00000", color: "#FFFFFF", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 6px 20px rgba(192,0,0,0.35)" },
-  chatPanel: { width: 340, flexShrink: 0, borderLeft: "1px solid #E0E0E0", background: "#FFFFFF", display: "flex", flexDirection: "column", height: "calc(100vh - 65px)", position: "sticky", top: 65 },
+  chatPanel: { width: 340, flexShrink: 0, borderLeft: "1px solid #E0E0E0", background: "#FFFFFF", display: "flex", flexDirection: "column" },
   chatHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: "1px solid #E0E0E0" },
   chatBody: { flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 },
   chatBubbleWrap: { display: "flex", animation: "slideUp .25s ease" },
@@ -1350,6 +5057,7 @@ const styles = {
   chatBubbleAssistant: { background: "#F4F4F4", color: "#111111", border: "1px solid #E0E0E0" },
   chatInputRow: { display: "flex", gap: 8, padding: "12px 14px", borderTop: "1px solid #E0E0E0" },
   chatInput: { flex: 1, background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111", padding: "9px 12px", fontSize: 13, outline: "none" },
+  chatTextarea: { flex: 1, background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111", padding: "9px 12px", fontSize: 13, outline: "none", resize: "vertical", minHeight: 60, maxHeight: 220, fontFamily: "inherit", lineHeight: 1.4 },
   chatSendBtn: { background: "#C00000", border: "none", borderRadius: 8, width: 38, display: "flex", alignItems: "center", justifyContent: "center", color: "#FFFFFF", cursor: "pointer" },
   diffCard: { background: "#FFFFFF", border: "1px solid #C00000", borderRadius: 10, padding: "12px 14px", width: "100%", animation: "slideUp .2s ease" },
   diffLine: { fontSize: 13.5 },

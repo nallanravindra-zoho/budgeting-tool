@@ -1,8 +1,8 @@
 /**
  * Zoho Analytics API client
  * ---------------------------
- * Called only from functions/index.js's syncCipr scheduled function —
- * never exposed to the frontend. Credentials are passed in explicitly
+ * Called only from functions/index.js's syncCipr and syncBudgets callable
+ * functions — never exposed to the frontend. Credentials are passed in explicitly
  * (Cloud Functions v2's secret-binding pattern), not read from process.env
  * directly, so this module has no hidden dependency on how the caller
  * manages configuration.
@@ -43,10 +43,14 @@ async function zohoRequest(path, accessToken, orgId, opts = {}) {
 }
 
 /**
- * Pulls the full CIPR report and returns it as an array of row objects.
+ * Pulls a full Zoho Analytics view and returns it as an array of row objects.
+ * Generic — used for the CIPR actuals view AND the three budget views
+ * (month-wise, country-wise, vendor-wise). Same job-creation/poll/download
+ * mechanics for all of them; only the viewId (and what the caller does with
+ * the resulting rows) differs.
  * @param {{clientId, clientSecret, refreshToken, orgId, workspaceId, viewId}} params
  */
-async function exportCiprReport({ clientId, clientSecret, refreshToken, orgId, workspaceId, viewId }) {
+async function exportZohoView({ clientId, clientSecret, refreshToken, orgId, workspaceId, viewId }) {
   const accessToken = await getAccessToken({ clientId, clientSecret, refreshToken });
 
   const config = encodeURIComponent(JSON.stringify({ responseFormat: "json" }));
@@ -58,15 +62,21 @@ async function exportCiprReport({ clientId, clientSecret, refreshToken, orgId, w
   const jobId = createRes?.data?.jobId;
   if (!jobId) throw new Error(`Zoho export job creation failed: ${JSON.stringify(createRes)}`);
 
+  // Was 20 attempts x 3s = a hardcoded 60s ceiling — too short for larger
+  // exports (e.g. multi-year CIPR history). 80 x 3s = 4 minutes. Must stay
+  // comfortably under the calling Cloud Function's own timeoutSeconds
+  // (see functions/index.js) or the function gets killed first and this
+  // error never even gets the chance to fire.
   let status = "IN PROGRESS", attempts = 0;
-  while (status !== "JOB COMPLETED" && attempts < 20) {
+  const MAX_ATTEMPTS = 80;
+  while (status !== "JOB COMPLETED" && attempts < MAX_ATTEMPTS) {
     await new Promise(r => setTimeout(r, 3000));
     const statusRes = await zohoRequest(`/restapi/v2/bulk/workspaces/${workspaceId}/exportjobs/${jobId}`, accessToken, orgId);
     status = statusRes?.data?.jobStatus;
     attempts++;
     if (status === "JOB FAILED") throw new Error(`Zoho export job failed: ${JSON.stringify(statusRes)}`);
   }
-  if (status !== "JOB COMPLETED") throw new Error("Zoho export job timed out after 60s");
+  if (status !== "JOB COMPLETED") throw new Error(`Zoho export job timed out after ${MAX_ATTEMPTS * 3}s`);
 
   const downloadRes = await zohoRequest(`/restapi/v2/bulk/workspaces/${workspaceId}/exportjobs/${jobId}/data`, accessToken, orgId);
 
@@ -86,4 +96,11 @@ async function exportCiprReport({ clientId, clientSecret, refreshToken, orgId, w
   throw new Error(`Unexpected Zoho export data shape — top-level keys: ${JSON.stringify(Object.keys(downloadRes || {}))}, data keys: ${JSON.stringify(raw && typeof raw === "object" ? Object.keys(raw) : raw)}. Raw (truncated): ${JSON.stringify(downloadRes).slice(0, 600)}`);
 }
 
-module.exports = { exportCiprReport };
+/**
+ * Backward-compatible alias — functions/index.js's syncCipr was written
+ * against this name. Keeping it avoids touching that call site just for
+ * a rename; new code (syncBudgets) calls exportZohoView directly.
+ */
+const exportCiprReport = exportZohoView;
+
+module.exports = { exportZohoView, exportCiprReport };
