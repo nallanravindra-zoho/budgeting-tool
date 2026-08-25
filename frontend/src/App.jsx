@@ -1005,7 +1005,7 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
         <div style={styles.logoMark}>CK</div>
         <div>
           <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
-          <div style={styles.brandSub}>Revenue, GP &amp; Performance Intelligence</div>
+          <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
           <div style={styles.brandSub}>{todayLabel}</div>
         </div>
       </div>
