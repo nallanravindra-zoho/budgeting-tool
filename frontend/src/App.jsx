@@ -61,6 +61,12 @@ const fmtByUnit = (n, unit) => {
 const fmtPct = (n) => `${((n || 0) * 100).toFixed(1)}%`;
 const fmtPct1 = (n) => `${((n || 0) * 100).toFixed(1)}%`;
 const fmtSignedPct = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)}%`;
+// fmtN/fmtMillions puts the minus sign INSIDE the $ ("$-0.97M") — matches
+// how the rest of the app already displays negative currency everywhere
+// else, so left as-is there. Overview's KPI delta lines specifically want
+// the sign outside ("-$0.97M"), so this is a scoped wrapper for just that
+// spot rather than changing fmtN app-wide.
+const fmtSignedN = (n, fmtN) => `${n < 0 ? "-" : ""}${fmtN(Math.abs(n))}`;
 
 // Global unit toggle (item 5) — one shared state (App-level, provided here
 // via context) drives every monetary number in the app: KPI cards, every
@@ -533,21 +539,26 @@ export default function App() {
     const totalBudgetRev = scenarioVendors.reduce((s, v) => s + v.budget_revenue, 0);
     const totalBudgetGp = scenarioVendors.reduce((s, v) => s + v.budget_gp, 0);
     const totalYtdBudget = scenarioVendors.reduce((s, v) => s + v.ytd_budget_revenue * (scenario === "SKO" ? (1 + skoUplift) : 1), 0);
+    const totalYtdBudgetGp = scenarioVendors.reduce((s, v) => s + (v.ytd_budget_gp || 0) * (scenario === "SKO" ? (1 + skoUplift) : 1), 0);
     const totalActualYtd = scenarioVendors.reduce((s, v) => s + v.actual_revenue_ytd, 0);
     const totalActualGpYtd = scenarioVendors.reduce((s, v) => s + v.actual_gp_ytd, 0);
     const varAmt = totalActualYtd - totalYtdBudget;
     const varPct = totalYtdBudget ? varAmt / totalYtdBudget : 0;
+    const gpVarAmt = totalActualGpYtd - totalYtdBudgetGp;
+    const gpVarPct = totalYtdBudgetGp ? gpVarAmt / totalYtdBudgetGp : 0;
     const blendedGpPct = totalBudgetRev ? totalBudgetGp / totalBudgetRev : 0;
     const actualGpPct = totalActualYtd ? totalActualGpYtd / totalActualYtd : 0;
     const totalFyForecastRev = enrichedVendors.reduce((s, v) => s + (v.fyForecastRevenue || 0), 0);
     const totalFyForecastGp = enrichedVendors.reduce((s, v) => s + (v.fyForecastGp || 0), 0);
     const forecastVarAmt = totalFyForecastRev - totalBudgetRev;
     const forecastVarPct = totalBudgetRev ? forecastVarAmt / totalBudgetRev : 0;
+    const gpForecastVarAmt = totalFyForecastGp - totalBudgetGp;
+    const gpForecastVarPct = totalBudgetGp ? gpForecastVarAmt / totalBudgetGp : 0;
     const forecastGpPct = totalFyForecastRev ? totalFyForecastGp / totalFyForecastRev : 0;
     const gpForecastVarPts = (forecastGpPct - blendedGpPct) * 100;
     return {
-      totalBudgetRev, totalBudgetGp, totalYtdBudget, totalActualYtd, totalActualGpYtd, varAmt, varPct, blendedGpPct, actualGpPct,
-      totalFyForecastRev, totalFyForecastGp, forecastVarAmt, forecastVarPct, forecastGpPct, gpForecastVarPts,
+      totalBudgetRev, totalBudgetGp, totalYtdBudget, totalYtdBudgetGp, totalActualYtd, totalActualGpYtd, varAmt, varPct, gpVarAmt, gpVarPct, blendedGpPct, actualGpPct,
+      totalFyForecastRev, totalFyForecastGp, forecastVarAmt, forecastVarPct, gpForecastVarAmt, gpForecastVarPct, forecastGpPct, gpForecastVarPts,
     };
   }, [scenarioVendors, enrichedVendors, scenario, skoUplift]);
 
@@ -1214,7 +1225,11 @@ const KPI_TIER_COLORS = {
 // `icon`/`iconTier`/`pill`/`pillTier` are all optional — every existing
 // caller (P&L, Employees, Operational Stats, Cash Flow) renders exactly as
 // before when they're omitted.
-function KpiCard({ label, value, sub, trend, icon: Icon, iconTier, pill, pillTier }) {
+// `subLine2` is a second, more muted line below `sub` — e.g. the
+// "vs YTD Plan ($99.10M)" baseline reference under a "$20.50M (+20.7%)"
+// delta line. Optional; existing callers that only pass `sub` are
+// unaffected.
+function KpiCard({ label, value, sub, subLine2, trend, icon: Icon, iconTier, pill, pillTier }) {
   const tier = iconTier || (trend === "up" ? "good" : trend === "down" ? "bad" : null);
   const tierColors = tier ? KPI_TIER_COLORS[tier] : null;
   return (
@@ -1229,6 +1244,7 @@ function KpiCard({ label, value, sub, trend, icon: Icon, iconTier, pill, pillTie
             {sub}
           </div>
         )}
+        {subLine2 && <div style={{ fontSize: 11, color: "#8A8A8A", marginTop: 2 }}>{subLine2}</div>}
         {pill && (
           <div style={{ display: "inline-block", marginTop: 8, fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 20, color: KPI_TIER_COLORS[pillTier || "neutral"].fg, background: KPI_TIER_COLORS[pillTier || "neutral"].bg }}>
             {pill}
@@ -1478,22 +1494,26 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
 
       <div style={styles.kpiGrid}>
         <KpiCard
-          label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`}
+          label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)}
+          sub={`${fmtSignedN(kpis.varAmt, fmtN)} (${fmtSignedPct(kpis.varPct)})`} subLine2={`vs YTD Plan (${fmtN(kpis.totalYtdBudget)})`}
           trend={kpis.varAmt >= 0 ? "up" : "down"} icon={BarChart3} iconTier={revenueOutlook(kpis.varPct, "plan").tier}
         />
         <KpiCard
-          label="FY Revenue Forecast" value={fmtN(kpis.totalFyForecastRev)} sub={`${fmtSignedPct(kpis.forecastVarPct)} vs ${fmtN(kpis.totalBudgetRev)} budget`}
+          label="FY Revenue Forecast" value={fmtN(kpis.totalFyForecastRev)}
+          sub={`${fmtSignedN(kpis.forecastVarAmt, fmtN)} (${fmtSignedPct(kpis.forecastVarPct)})`} subLine2={`vs Budget (${fmtN(kpis.totalBudgetRev)})`}
           trend={kpis.forecastVarAmt >= 0 ? "up" : "down"} icon={TrendingUp} iconTier={revenueOutlook(kpis.forecastVarPct, "budget").tier}
           pill={revenueOutlook(kpis.forecastVarPct, "budget").text} pillTier={revenueOutlook(kpis.forecastVarPct, "budget").tier}
         />
         <KpiCard
-          label="YTD Gross Profit (Actual)" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP% vs ${fmtPct(kpis.blendedGpPct)} plan`}
-          trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").tier}
+          label="YTD Gross Profit (Actual)" value={fmtN(kpis.totalActualGpYtd)}
+          sub={`${fmtSignedN(kpis.gpVarAmt, fmtN)} (${fmtSignedPct(kpis.gpVarPct)})`} subLine2={`vs YTD Plan (${fmtN(kpis.totalYtdBudgetGp)})`}
+          trend={kpis.gpVarAmt >= 0 ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").tier}
           pill={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").text} pillTier={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").tier}
         />
         <KpiCard
-          label="FY GP Forecast" value={fmtN(kpis.totalFyForecastGp)} sub={`${fmtPct(kpis.forecastGpPct)} FY GP%`}
-          trend={kpis.gpForecastVarPts >= 0 ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
+          label="FY GP Forecast" value={fmtN(kpis.totalFyForecastGp)}
+          sub={`${fmtSignedN(kpis.gpForecastVarAmt, fmtN)} (${fmtSignedPct(kpis.gpForecastVarPct)})`} subLine2={`vs Budget (${fmtN(kpis.totalBudgetGp)})`}
+          trend={kpis.gpForecastVarAmt >= 0 ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
           pill={gpOutlook(kpis.gpForecastVarPts, "budget margin").text} pillTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
         />
       </div>
