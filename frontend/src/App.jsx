@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList } from "lucide-react";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info } from "lucide-react";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
 import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
@@ -1072,6 +1072,8 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
   const { unit, setUnit } = useNumberUnit();
   const today = new Date();
   const todayLabel = today.toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
+  const shortDateLabel = today.toLocaleDateString("en-US", { day: "numeric", month: "short", year: "numeric" });
+  const cutoffIdx = getActualCutoffMonthIndex(year);
   return (
     <header style={{ ...styles.topBar, flexWrap: "wrap", rowGap: 6 }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -1085,12 +1087,11 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
               icon. cutoffIdx can be -1 (no closed months yet, e.g. a future
               year not underway) — guarded to avoid an "Actuals through
               undefined" label in that case. */}
-          {(() => {
-            const cutoffIdx = getActualCutoffMonthIndex(year);
-            return cutoffIdx >= 0 ? (
-              <div style={{ fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>Actuals through {MONTHS[cutoffIdx]} {year}</div>
-            ) : null;
-          })()}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
+            <span>Data as of {shortDateLabel}</span>
+            <Info size={11} style={{ flexShrink: 0 }} title="Today's date — the app doesn't back-date figures; every number reflects data synced as of this moment." />
+            {cutoffIdx >= 0 && (<><span>|</span><span>Actuals through {MONTHS[cutoffIdx]} {year}</span></>)}
+          </div>
         </div>
       </div>
 
@@ -1201,16 +1202,42 @@ function Sidebar({ tab, setTab, versionsCount, allowedTabs, width, onStartResize
   );
 }
 
-function KpiCard({ label, value, sub, trend }) {
+// Shared good/neutral/bad palette for the optional icon badge + pill below
+// — used by Overview's KPI tiles today; any other KpiCard caller that
+// starts passing icon/pill gets the same treatment for free.
+const KPI_TIER_COLORS = {
+  good: { fg: "#1B8A3A", bg: "#E8F5E9" },
+  neutral: { fg: "#9A6B12", bg: "#FFF3DC" },
+  bad: { fg: "#C0392B", bg: "#FBE3E1" },
+};
+
+// `icon`/`iconTier`/`pill`/`pillTier` are all optional — every existing
+// caller (P&L, Employees, Operational Stats, Cash Flow) renders exactly as
+// before when they're omitted.
+function KpiCard({ label, value, sub, trend, icon: Icon, iconTier, pill, pillTier }) {
+  const tier = iconTier || (trend === "up" ? "good" : trend === "down" ? "bad" : null);
+  const tierColors = tier ? KPI_TIER_COLORS[tier] : null;
   return (
-    <div style={styles.kpiCard}>
-      <div style={styles.kpiLabel}>{label}</div>
-      <div className="num" style={styles.kpiValue}>{value}</div>
-      {sub && (
-        <div style={{ ...styles.kpiSub, color: trend === "up" ? "#1B8A3A" : trend === "down" ? "#C00000" : "#6B6B6B" }}>
-          {trend === "up" && <TrendingUp size={13} style={{ marginRight: 4, verticalAlign: -2 }} />}
-          {trend === "down" && <TrendingDown size={13} style={{ marginRight: 4, verticalAlign: -2 }} />}
-          {sub}
+    <div style={{ ...styles.kpiCard, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={styles.kpiLabel}>{label}</div>
+        <div className="num" style={styles.kpiValue}>{value}</div>
+        {sub && (
+          <div style={{ ...styles.kpiSub, color: trend === "up" ? "#1B8A3A" : trend === "down" ? "#C00000" : "#6B6B6B" }}>
+            {trend === "up" && <TrendingUp size={13} style={{ marginRight: 4, verticalAlign: -2 }} />}
+            {trend === "down" && <TrendingDown size={13} style={{ marginRight: 4, verticalAlign: -2 }} />}
+            {sub}
+          </div>
+        )}
+        {pill && (
+          <div style={{ display: "inline-block", marginTop: 8, fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 20, color: KPI_TIER_COLORS[pillTier || "neutral"].fg, background: KPI_TIER_COLORS[pillTier || "neutral"].bg }}>
+            {pill}
+          </div>
+        )}
+      </div>
+      {Icon && tierColors && (
+        <div style={{ width: 38, height: 38, borderRadius: "50%", background: tierColors.bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <Icon size={17} color={tierColors.fg} />
         </div>
       )}
     </div>
@@ -1269,18 +1296,24 @@ function CollapsiblePanel({ title, children, defaultHeight = 280, maximizedHeigh
   );
 }
 
-// Short, human-readable taglines for the FY Forecast KPI tiles —
-// presentational heuristics (not validated finance policy), same spirit
-// as the vendor status thresholds in vendorPerformance.js.
-function forecastTagline(forecastVarPct) {
-  if (forecastVarPct >= 0.05) return "On track to exceed budget";
-  if (forecastVarPct >= -0.02) return "Tracking close to budget";
-  return "Trailing budget";
+// good/neutral/bad classification + short tagline for the revenue KPI
+// tiles (icon badge color, pill color+text). Reuses the SAME achievement
+// thresholds computeVendorStatus already uses per-vendor (80%/95%
+// revenue-achievement -> Needs Attention/Watch/On Track), just expressed
+// as variance % instead of an achievement ratio, so tile coloring stays
+// consistent with the rest of the app rather than inventing new numbers.
+function revenueOutlook(varPct, label) {
+  if (varPct <= -0.20) return { tier: "bad", text: `Trailing ${label}` };
+  if (varPct <= -0.05) return { tier: "neutral", text: `Tracking below ${label}` };
+  if (varPct >= 0.05) return { tier: "good", text: `On track to exceed ${label}` };
+  return { tier: "good", text: `Tracking close to ${label}` };
 }
-function gpForecastTagline(gpForecastVarPts) {
-  if (gpForecastVarPts >= 0.5) return "Ahead of budget margin";
-  if (gpForecastVarPts >= -0.5) return "In line with budget margin";
-  return "Slightly below budget margin";
+// Same idea for the GP-margin KPI tiles, reusing computeVendorStatus's
+// own 3-point GP-gap threshold (Margin Risk) instead of a new one.
+function gpOutlook(gpDiffPts, label) {
+  if (gpDiffPts >= 0) return { tier: "good", text: `${gpDiffPts.toFixed(1)} pts ahead of ${label}` };
+  if (gpDiffPts >= -3) return { tier: "neutral", text: `${Math.abs(gpDiffPts).toFixed(1)} pts below ${label}` };
+  return { tier: "bad", text: `${Math.abs(gpDiffPts).toFixed(1)} pts below ${label}` };
 }
 // Deterministic (not AI-generated) headline for the Management Snapshot —
 // built from the sign/magnitude of revenue and GP variance.
@@ -1444,10 +1477,25 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
       <ManagementSnapshot kpis={kpis} needsAttentionTotal={needsAttentionTotal} fmtN={fmtN} onNavigate={onNavigate} />
 
       <div style={styles.kpiGrid}>
-        <KpiCard label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`} trend={kpis.varAmt >= 0 ? "up" : "down"} />
-        <KpiCard label="FY Revenue Forecast" value={fmtN(kpis.totalFyForecastRev)} sub={`${fmtSignedPct(kpis.forecastVarPct)} vs ${fmtN(kpis.totalBudgetRev)} budget — ${forecastTagline(kpis.forecastVarPct)}`} trend={kpis.forecastVarAmt >= 0 ? "up" : "down"} />
-        <KpiCard label="YTD Gross Profit (Actual)" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP% vs ${fmtPct(kpis.blendedGpPct)} plan`} trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} />
-        <KpiCard label="FY GP Forecast" value={fmtN(kpis.totalFyForecastGp)} sub={`${fmtPct(kpis.forecastGpPct)} FY GP% — ${gpForecastTagline(kpis.gpForecastVarPts)}`} trend={kpis.gpForecastVarPts >= 0 ? "up" : "down"} />
+        <KpiCard
+          label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`}
+          trend={kpis.varAmt >= 0 ? "up" : "down"} icon={BarChart3} iconTier={revenueOutlook(kpis.varPct, "plan").tier}
+        />
+        <KpiCard
+          label="FY Revenue Forecast" value={fmtN(kpis.totalFyForecastRev)} sub={`${fmtSignedPct(kpis.forecastVarPct)} vs ${fmtN(kpis.totalBudgetRev)} budget`}
+          trend={kpis.forecastVarAmt >= 0 ? "up" : "down"} icon={TrendingUp} iconTier={revenueOutlook(kpis.forecastVarPct, "budget").tier}
+          pill={revenueOutlook(kpis.forecastVarPct, "budget").text} pillTier={revenueOutlook(kpis.forecastVarPct, "budget").tier}
+        />
+        <KpiCard
+          label="YTD Gross Profit (Actual)" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP% vs ${fmtPct(kpis.blendedGpPct)} plan`}
+          trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").tier}
+          pill={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").text} pillTier={gpOutlook((kpis.actualGpPct - kpis.blendedGpPct) * 100, "budget margin").tier}
+        />
+        <KpiCard
+          label="FY GP Forecast" value={fmtN(kpis.totalFyForecastGp)} sub={`${fmtPct(kpis.forecastGpPct)} FY GP%`}
+          trend={kpis.gpForecastVarPts >= 0 ? "up" : "down"} icon={PieChartIcon} iconTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
+          pill={gpOutlook(kpis.gpForecastVarPts, "budget margin").text} pillTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
+        />
       </div>
 
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
