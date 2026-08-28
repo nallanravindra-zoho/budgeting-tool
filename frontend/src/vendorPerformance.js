@@ -78,7 +78,7 @@ export function computeFySystemForecast(vendorRow, year) {
   const fyForecastRevenue = ytdActual + remainingBudget * runRateRatio;
   const fyForecastGp = ytdActualGp + remainingBudgetGp * gpRunRateRatio;
 
-  return { fyForecastRevenue, fyForecastGp, runRateRatio };
+  return { fyForecastRevenue, fyForecastGp, runRateRatio, gpRunRateRatio };
 }
 
 // ---- Vendor status ----------------------------------------------------------

@@ -88,14 +88,17 @@ function assertEditableYear(year, activeBudgetingYear) {
 // hardcoded to August (index 7) everywhere under the assumption the app
 // would only ever show the current year. Now computed per year: a closed
 // past year has a full 12 months of real actuals; the current year has
-// however many months have actually elapsed; a future year (the active
-// budgeting year, before it's underway) has none yet. Returns a 0-indexed
-// month (11 = December, -1 = no months yet) — used as an inclusive cutoff.
+// however many months have actually CLOSED (not the in-progress current
+// month — its actuals are necessarily partial, so treating it as "closed"
+// overstated freshness and drew chart lines through an incomplete month);
+// a future year (the active budgeting year, before it's underway) has none
+// yet. Returns a 0-indexed month (11 = December, -1 = no months yet) — used
+// as an inclusive cutoff.
 export function getActualCutoffMonthIndex(year) {
   const currentCalendarYear = new Date().getFullYear();
   if (year < currentCalendarYear) return 11;
   if (year > currentCalendarYear) return -1;
-  return new Date().getMonth();
+  return new Date().getMonth() - 1; // naturally -1 in January = no closed months yet
 }
 
 export async function getVendors(year) {
@@ -190,6 +193,12 @@ export async function getVendors(year) {
       tier: a.tier || null,
       regions: a.regionRevenue ? Object.keys(a.regionRevenue) : [],
       region_revenue: a.regionRevenue || {},
+      // Written by syncCipr (functions/index.js) on every vendor doc in a
+      // sync batch — same timestamp across all of them. Surfaced here so
+      // the UI can show a "last synced" freshness indicator that survives
+      // a page reload, instead of only knowing about a sync triggered in
+      // the current browser session.
+      last_synced_at: a.lastSyncedAt?.toDate ? a.lastSyncedAt.toDate() : null,
     });
   }
   return out.sort((x, y) => y.budget_revenue - x.budget_revenue);

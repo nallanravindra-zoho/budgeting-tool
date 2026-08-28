@@ -520,6 +520,15 @@ export default function App() {
     }));
   }, [vendors, scenario, skoUplift]);
 
+  // Per-vendor FY System Forecast (run-rate method) — same function
+  // VendorPerformanceView already uses per-row; computed once here too so
+  // Overview can show a company-wide FY Forecast without re-deriving the
+  // run-rate math itself.
+  const enrichedVendors = useMemo(() =>
+    scenarioVendors.map(v => ({ ...v, ...computeFySystemForecast(v, year) })),
+    [scenarioVendors, year]
+  );
+
   const kpis = useMemo(() => {
     const totalBudgetRev = scenarioVendors.reduce((s, v) => s + v.budget_revenue, 0);
     const totalBudgetGp = scenarioVendors.reduce((s, v) => s + v.budget_gp, 0);
@@ -530,17 +539,36 @@ export default function App() {
     const varPct = totalYtdBudget ? varAmt / totalYtdBudget : 0;
     const blendedGpPct = totalBudgetRev ? totalBudgetGp / totalBudgetRev : 0;
     const actualGpPct = totalActualYtd ? totalActualGpYtd / totalActualYtd : 0;
-    return { totalBudgetRev, totalBudgetGp, totalYtdBudget, totalActualYtd, totalActualGpYtd, varAmt, varPct, blendedGpPct, actualGpPct };
-  }, [scenarioVendors, scenario, skoUplift]);
+    const totalFyForecastRev = enrichedVendors.reduce((s, v) => s + (v.fyForecastRevenue || 0), 0);
+    const totalFyForecastGp = enrichedVendors.reduce((s, v) => s + (v.fyForecastGp || 0), 0);
+    const forecastVarAmt = totalFyForecastRev - totalBudgetRev;
+    const forecastVarPct = totalBudgetRev ? forecastVarAmt / totalBudgetRev : 0;
+    const forecastGpPct = totalFyForecastRev ? totalFyForecastGp / totalFyForecastRev : 0;
+    const gpForecastVarPts = (forecastGpPct - blendedGpPct) * 100;
+    return {
+      totalBudgetRev, totalBudgetGp, totalYtdBudget, totalActualYtd, totalActualGpYtd, varAmt, varPct, blendedGpPct, actualGpPct,
+      totalFyForecastRev, totalFyForecastGp, forecastVarAmt, forecastVarPct, forecastGpPct, gpForecastVarPts,
+    };
+  }, [scenarioVendors, enrichedVendors, scenario, skoUplift]);
 
   const monthlyData = useMemo(() => {
     const cutoffIdx = getActualCutoffMonthIndex(year);
     return MONTHS.map((m, i) => {
       const budget = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_revenue?.[i] || 0), 0);
       const actual = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_revenue?.[i] || 0), 0) : null;
-      return { month: m, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null };
+      // Forecast: null through the closed months; at the cutoff month it
+      // mirrors Actual so the dashed Forecast line visually picks up
+      // exactly where the solid Actual line ends (no gap/jump); beyond
+      // that, each vendor's own run-rate ratio (YTD actual / YTD budget)
+      // applied to its own remaining-month budget phasing, summed — the
+      // same math computeFySystemForecast uses for the FY total, just at
+      // monthly granularity.
+      let forecast = null;
+      if (i === cutoffIdx) forecast = actual;
+      else if (i > cutoffIdx) forecast = enrichedVendors.reduce((s, v) => s + (v.monthly_budget_revenue?.[i] || 0) * (v.runRateRatio ?? 1), 0);
+      return { month: m, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null, Forecast: forecast !== null ? Math.round(forecast) : null };
     });
-  }, [scenarioVendors, year]);
+  }, [scenarioVendors, enrichedVendors, year]);
 
   const monthlyGpData = useMemo(() => {
     const cutoffIdx = getActualCutoffMonthIndex(year);
@@ -549,18 +577,61 @@ export default function App() {
       const budgetRev = scenarioVendors.reduce((s, v) => s + (v.monthly_budget_revenue?.[i] || 0), 0);
       const actualGp = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_gp?.[i] || 0), 0) : null;
       const actualRev = i <= cutoffIdx ? scenarioVendors.reduce((s, v) => s + (v.monthly_actual_revenue?.[i] || 0), 0) : null;
+      let forecastGp = null;
+      if (i === cutoffIdx) forecastGp = actualGp;
+      else if (i > cutoffIdx) forecastGp = enrichedVendors.reduce((s, v) => s + (v.monthly_budget_gp?.[i] || 0) * (v.gpRunRateRatio ?? 1), 0);
       return {
-        month: m, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null,
+        month: m, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null, Forecast: forecastGp !== null ? Math.round(forecastGp) : null,
         // Blended GP% (sum GP / sum revenue), not an average of each vendor's own %.
         "Budget GP%": budgetRev ? +(budgetGp / budgetRev * 100).toFixed(1) : 0,
         "Actual GP%": (actualRev !== null && actualRev) ? +(actualGp / actualRev * 100).toFixed(1) : null,
       };
     });
-  }, [scenarioVendors, year]);
+  }, [scenarioVendors, enrichedVendors, year]);
 
   const movers = useMemo(() => [...scenarioVendors]
     .map(v => ({ ...v, varAmt: v.actual_revenue_ytd - v.ytd_budget_revenue }))
     .sort((a, b) => Math.abs(b.varAmt) - Math.abs(a.varAmt)).slice(0, 6), [scenarioVendors]);
+
+  // Vendors whose actual GP% is trailing their budgeted GP% — same
+  // pts-behind math as computeVendorStatus's Margin Risk check, ranked
+  // instead of just thresholded, for Overview's "Top Margin Detractors".
+  const marginDetractors = useMemo(() => [...scenarioVendors]
+    .map(v => {
+      const budgetGpPct = v.budget_revenue > 0 ? v.budget_gp / v.budget_revenue : 0;
+      const actualGpPct = v.actual_revenue_ytd > 0 ? v.actual_gp_ytd / v.actual_revenue_ytd : 0;
+      return { ...v, gpPtsBehind: (budgetGpPct - actualGpPct) * 100 };
+    })
+    .filter(v => v.actual_revenue_ytd > 0 && v.gpPtsBehind > 0)
+    .sort((a, b) => b.gpPtsBehind - a.gpPtsBehind)
+    .slice(0, 5), [scenarioVendors]);
+
+  // Persisted "last synced" timestamp — read back from Firestore (written
+  // by syncCipr on every vendor doc, see firestoreData.js getVendors), so
+  // the freshness indicator in TopBar survives a page reload instead of
+  // only knowing about a sync triggered in the current browser session.
+  const persistedLastSyncedAt = useMemo(() => {
+    const stamps = vendors.map(v => v.last_synced_at).filter(Boolean);
+    return stamps.length ? new Date(Math.max(...stamps.map(d => d.getTime()))) : null;
+  }, [vendors]);
+
+  // Company-wide vendor status distribution — same computeVendorStatus
+  // used per-row on VendorPerformanceView, just counted here for
+  // Overview's Management Snapshot ("N vendors need attention").
+  const vendorStatusCounts = useMemo(() => {
+    const counts = { on_track: 0, watch: 0, needs_attention: 0, margin_risk: 0 };
+    scenarioVendors.forEach(v => { const s = computeVendorStatus(v); counts[s] = (counts[s] || 0) + 1; });
+    return counts;
+  }, [scenarioVendors]);
+
+  // Top-3-vendors-by-budget-revenue as a % of total budget revenue — a
+  // simple concentration-risk signal for Overview's Risks & Opportunities.
+  const top3ConcentrationPct = useMemo(() => {
+    const totalBudget = scenarioVendors.reduce((s, v) => s + v.budget_revenue, 0);
+    if (!totalBudget) return 0;
+    const top3 = [...scenarioVendors].sort((a, b) => b.budget_revenue - a.budget_revenue).slice(0, 3);
+    return top3.reduce((s, v) => s + v.budget_revenue, 0) / totalBudget;
+  }, [scenarioVendors]);
 
   const tableVendors = useMemo(() => {
     let rows = scenarioVendors.filter(v => v.vendor.toLowerCase().includes(search.toLowerCase()));
@@ -883,7 +954,7 @@ export default function App() {
       <div>
         <TopBar
           scenario={scenario} setScenario={setScenario} skoUplift={skoUplift} onSave={() => setSaveModalOpen(true)} onSync={syncNow} syncing={syncing}
-          year={year} activeBudgetingYear={activeBudgetingYear} lastSyncedAt={lastSyncedAt}
+          year={year} activeBudgetingYear={activeBudgetingYear} lastSyncedAt={lastSyncedAt || persistedLastSyncedAt}
           availableYears={availableYears} onYearChange={handleYearChange} isEditableYear={isEditableYear}
         />
       </div>
@@ -908,6 +979,8 @@ export default function App() {
           {effectiveTab === "overview" && (
             <OverviewTab
               kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
+              year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab}
+              vendorStatusCounts={vendorStatusCounts} top3ConcentrationPct={top3ConcentrationPct}
             />
           )}
           {effectiveTab === "vendors" && (
@@ -1007,6 +1080,17 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
           <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
           <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
           <div style={styles.brandSub}>{todayLabel}</div>
+          {/* Explicit freshness line — so it's clear at a glance whether the
+              numbers on screen are current, without hunting for the sync
+              icon. cutoffIdx can be -1 (no closed months yet, e.g. a future
+              year not underway) — guarded to avoid an "Actuals through
+              undefined" label in that case. */}
+          {(() => {
+            const cutoffIdx = getActualCutoffMonthIndex(year);
+            return cutoffIdx >= 0 ? (
+              <div style={{ fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>Actuals through {MONTHS[cutoffIdx]} {year}</div>
+            ) : null;
+          })()}
         </div>
       </div>
 
@@ -1024,7 +1108,11 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
             <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
           </div>
           <div style={{ fontSize: 9.5, color: "#8A8A8A", whiteSpace: "nowrap" }}>
-            {lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : "Not synced this session"}
+            {/* Prefers this session's own sync click; falls back to the
+                persisted lastSyncedAt read back from Firestore (written by
+                syncCipr) — so this survives a page reload instead of
+                resetting to "not synced" every time. */}
+            {lastSyncedAt ? `Last synced ${lastSyncedAt.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : "Not synced yet"}
           </div>
         </div>
         <button onClick={onSync} disabled={syncing} style={styles.iconBtnGhost} title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}>
@@ -1181,11 +1269,52 @@ function CollapsiblePanel({ title, children, defaultHeight = 280, maximizedHeigh
   );
 }
 
-function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear }) {
+// Short, human-readable taglines for the FY Forecast KPI tiles —
+// presentational heuristics (not validated finance policy), same spirit
+// as the vendor status thresholds in vendorPerformance.js.
+function forecastTagline(forecastVarPct) {
+  if (forecastVarPct >= 0.05) return "On track to exceed budget";
+  if (forecastVarPct >= -0.02) return "Tracking close to budget";
+  return "Trailing budget";
+}
+function gpForecastTagline(gpForecastVarPts) {
+  if (gpForecastVarPts >= 0.5) return "Ahead of budget margin";
+  if (gpForecastVarPts >= -0.5) return "In line with budget margin";
+  return "Slightly below budget margin";
+}
+// Deterministic (not AI-generated) headline for the Management Snapshot —
+// built from the sign/magnitude of revenue and GP variance.
+function buildSnapshotHeadline(kpis) {
+  const revUp = kpis.varPct >= 0.02, revDown = kpis.varPct <= -0.02;
+  const gpBehind = kpis.actualGpPct < kpis.blendedGpPct - 0.003; // >0.3pt behind
+  if (revUp && gpBehind) return "Revenue is ahead of plan, but margin is under pressure.";
+  if (revUp && !gpBehind) return "Revenue and margin are both tracking ahead of plan.";
+  if (revDown && gpBehind) return "Revenue and margin are both trailing plan.";
+  if (revDown && !gpBehind) return "Revenue is trailing plan, though margin is holding up.";
+  return "Revenue and margin are tracking close to plan.";
+}
+// Custom dot renderer for the Actual line — draws every closed month's
+// point at normal size, and an emphasized larger marker only at the last
+// closed month (cutoffIdx), so the eye lands on exactly where "actual"
+// stops and "forecast" takes over. Only meaningful for the Monthly view,
+// which is the only one keyed by a real month index.
+function actualEndpointDot(cutoffIdx, viewMode) {
+  if (viewMode !== "monthly") return { r: 3 };
+  return (props) => {
+    const { cx, cy, index, value, stroke } = props;
+    if (value === null || value === undefined || cx == null || cy == null) return null;
+    const isLast = index === cutoffIdx;
+    return <circle key={`dot-${index}`} cx={cx} cy={cy} r={isLast ? 5.5 : 2.5} fill={isLast ? stroke : "#FFFFFF"} stroke={stroke} strokeWidth={isLast ? 2 : 1.5} />;
+  };
+}
+
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, vendorStatusCounts, top3ConcentrationPct }) {
   const { fmtN, unit } = useNumberUnit();
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
   const [yearlyRaw, setYearlyRaw] = useState(null);
   const [yearlyLoading, setYearlyLoading] = useState(false);
+  const [regionMovers, setRegionMovers] = useState(null);
+  const [regionLoading, setRegionLoading] = useState(true);
 
   // Yearly is a genuinely different data shape (multi-year totals, not a
   // breakdown of the currently-selected year) — fetched lazily, only once
@@ -1217,13 +1346,37 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
     })();
   }, [viewMode, activeBudgetingYear]);
 
+  // Top Regions for Key Drivers — lazy-fetched the same way the yearly
+  // view above is: region performance isn't part of the company-wide
+  // vendor aggregation App() already computes, so it's fetched here,
+  // ranked by $ delta vs YTD plan (same idea as `movers` for vendors).
+  useEffect(() => {
+    let cancelled = false;
+    setRegionLoading(true);
+    getRegionPerformanceData(year, "region", scenario)
+      .then(rows => {
+        if (cancelled) return;
+        const ranked = [...rows]
+          .map(r => ({ ...r, varAmt: r.actual_revenue_ytd - r.ytd_budget_revenue }))
+          .sort((a, b) => Math.abs(b.varAmt) - Math.abs(a.varAmt))
+          .slice(0, 5);
+        setRegionMovers(ranked);
+      })
+      .catch(e => { console.error("OverviewTab region fetch failed:", e); if (!cancelled) setRegionMovers([]); })
+      .finally(() => { if (!cancelled) setRegionLoading(false); });
+    return () => { cancelled = true; };
+  }, [year, scenario]);
+
   const QUARTERS = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
   const quarterlyData = useMemo(() => QUARTERS.map((idxs, qi) => {
     const budget = idxs.reduce((s, i) => s + (monthlyData[i]?.Budget || 0), 0);
     const actualVals = idxs.map(i => monthlyData[i]?.Actual);
     const hasActual = actualVals.some(v => v !== null && v !== undefined);
     const actual = hasActual ? actualVals.reduce((s, v) => s + (v || 0), 0) : null;
-    return { month: `Q${qi + 1}`, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null };
+    const forecastVals = idxs.map(i => monthlyData[i]?.Forecast);
+    const hasForecast = forecastVals.some(v => v !== null && v !== undefined);
+    const forecast = hasForecast ? forecastVals.reduce((s, v) => s + (v || 0), 0) : null;
+    return { month: `Q${qi + 1}`, Budget: Math.round(budget), Actual: actual !== null ? Math.round(actual) : null, Forecast: forecast !== null ? Math.round(forecast) : null };
   }), [monthlyData]);
 
   // Blended quarterly GP% (sum GP / sum Revenue across the quarter's
@@ -1237,13 +1390,20 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
     const hasActual = actualGpVals.some(v => v !== null && v !== undefined);
     const actualGp = hasActual ? actualGpVals.reduce((s, v) => s + (v || 0), 0) : null;
     const actualRev = hasActual ? actualRevVals.reduce((s, v) => s + (v || 0), 0) : null;
+    const forecastGpVals = idxs.map(i => monthlyGpData[i]?.Forecast);
+    const hasForecastGp = forecastGpVals.some(v => v !== null && v !== undefined);
+    const forecastGp = hasForecastGp ? forecastGpVals.reduce((s, v) => s + (v || 0), 0) : null;
     return {
-      month: `Q${qi + 1}`, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null,
+      month: `Q${qi + 1}`, Budget: Math.round(budgetGp), Actual: actualGp !== null ? Math.round(actualGp) : null, Forecast: forecastGp !== null ? Math.round(forecastGp) : null,
       "Budget GP%": budgetRev ? +(budgetGp / budgetRev * 100).toFixed(1) : 0,
       "Actual GP%": (actualRev !== null && actualRev) ? +(actualGp / actualRev * 100).toFixed(1) : null,
     };
   }), [monthlyData, monthlyGpData]);
 
+  // Yearly compares distinct calendar years, not "remaining months of this
+  // year" — a Forecast series doesn't mean the same thing there, so it's
+  // intentionally omitted for this view (see the `viewMode !== "yearly"`
+  // guard around the Forecast <Line> below).
   const yearlyRevenueData = useMemo(() => (yearlyRaw || []).map(d => ({
     month: d.year, Budget: Math.round(d.budgetRevenue), Actual: d.actualRevenue > 0 ? Math.round(d.actualRevenue) : null,
   })), [yearlyRaw]);
@@ -1256,14 +1416,38 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
   const chartData = viewMode === "monthly" ? monthlyData : viewMode === "quarterly" ? quarterlyData : yearlyRevenueData;
   const gpChartData = viewMode === "monthly" ? monthlyGpData : viewMode === "quarterly" ? quarterlyGpData : yearlyGpData;
   const periodLabel = { monthly: "Monthly", quarterly: "Quarterly", yearly: "By Year (last 5 years)" }[viewMode];
+  const cutoffIdx = getActualCutoffMonthIndex(year);
+
+  // One anomaly note: a single closed month whose Actual fell materially
+  // below that month's Budget while its immediate neighbors didn't —
+  // phrased as an observation to check, never a claimed cause (the app
+  // doesn't have the data to know *why* a month dipped).
+  const anomalyNote = useMemo(() => {
+    const varOf = (row) => (row?.Actual == null || !row?.Budget) ? null : (row.Actual - row.Budget) / row.Budget;
+    for (let i = 1; i < cutoffIdx; i++) {
+      const curVar = varOf(monthlyData[i]);
+      if (curVar === null || curVar > -0.3) continue;
+      const prevVar = varOf(monthlyData[i - 1]);
+      const nextVar = varOf(monthlyData[i + 1]);
+      if ((prevVar === null || prevVar > -0.15) && (nextVar === null || nextVar > -0.15)) {
+        return `Revenue dipped in ${monthlyData[i].month} ${year} relative to budget, while neighboring months didn't — worth checking for timing/seasonality before treating it as a trend.`;
+      }
+    }
+    return null;
+  }, [monthlyData, cutoffIdx, year]);
+
+  const needsAttentionTotal = (vendorStatusCounts?.needs_attention || 0) + (vendorStatusCounts?.margin_risk || 0);
+  const gpImpactEstimate = kpis.actualGpPct < kpis.blendedGpPct ? (kpis.blendedGpPct - kpis.actualGpPct) * kpis.totalActualYtd : 0;
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
+      <ManagementSnapshot kpis={kpis} needsAttentionTotal={needsAttentionTotal} fmtN={fmtN} onNavigate={onNavigate} />
+
       <div style={styles.kpiGrid}>
-        <KpiCard label={`Annual Budget Revenue (${scenario})`} value={fmtN(kpis.totalBudgetRev)} />
-        <KpiCard label="YTD Actual vs Budget" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`} trend={kpis.varAmt >= 0 ? "up" : "down"} />
-        <KpiCard label="Annual Budget GP" value={fmtN(kpis.totalBudgetGp)} sub={`${fmtPct(kpis.blendedGpPct)} blended GP%`} />
-        <KpiCard label="YTD Actual GP" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP%`} trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} />
+        <KpiCard label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)} sub={`${fmtSignedPct(kpis.varPct)} vs ${fmtN(kpis.totalYtdBudget)} plan`} trend={kpis.varAmt >= 0 ? "up" : "down"} />
+        <KpiCard label="FY Revenue Forecast" value={fmtN(kpis.totalFyForecastRev)} sub={`${fmtSignedPct(kpis.forecastVarPct)} vs ${fmtN(kpis.totalBudgetRev)} budget — ${forecastTagline(kpis.forecastVarPct)}`} trend={kpis.forecastVarAmt >= 0 ? "up" : "down"} />
+        <KpiCard label="YTD Gross Profit (Actual)" value={fmtN(kpis.totalActualGpYtd)} sub={`${fmtPct(kpis.actualGpPct)} realized GP% vs ${fmtPct(kpis.blendedGpPct)} plan`} trend={kpis.actualGpPct >= kpis.blendedGpPct ? "up" : "down"} />
+        <KpiCard label="FY GP Forecast" value={fmtN(kpis.totalFyForecastGp)} sub={`${fmtPct(kpis.forecastGpPct)} FY GP% — ${gpForecastTagline(kpis.gpForecastVarPts)}`} trend={kpis.gpForecastVarPts >= 0 ? "up" : "down"} />
       </div>
 
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
@@ -1274,44 +1458,201 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
         </div>
       </div>
 
-      <CollapsiblePanel title={`${periodLabel} Revenue — Budget vs Actual`}>
-        {(height) => (viewMode === "yearly" && yearlyLoading) ? (
-          <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
-        ) : (
-          <ResponsiveContainer width="100%" height={height}>
-            <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-              <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
-              <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
-              <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
-              <Legend />
-              <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
-              <Line type="monotone" dataKey="Actual" stroke="#C00000" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </CollapsiblePanel>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <CollapsiblePanel title={`${periodLabel} Revenue — Actual vs Budget vs Forecast`}>
+          {(height) => (viewMode === "yearly" && yearlyLoading) ? (
+            <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={height}>
+              <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+                <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
+                <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+                <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} cursor={{ stroke: "#B4231E", strokeDasharray: "3 3" }} />
+                <Legend verticalAlign="bottom" />
+                <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+                <Line type="monotone" dataKey="Actual" stroke="#C00000" strokeWidth={2.5} dot={actualEndpointDot(cutoffIdx, viewMode)} connectNulls={false} />
+                {viewMode !== "yearly" && <Line type="monotone" dataKey="Forecast" stroke="#2E5FA3" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={false} />}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </CollapsiblePanel>
 
-      <CollapsiblePanel title={`${periodLabel} Gross Profit — Budget vs Actual (with GP%)`}>
-        {(height) => (viewMode === "yearly" && yearlyLoading) ? (
-          <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
-        ) : (
-          <ResponsiveContainer width="100%" height={height}>
-            <LineChart data={gpChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-              <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
-              <YAxis yAxisId="left" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
-              <YAxis yAxisId="right" orientation="right" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => `${v}%`} width={44} domain={[0, "dataMax"]} />
-              <Tooltip formatter={(v, name) => name.includes("GP%") ? `${v}%` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} />
-              <Legend />
-              <Line yAxisId="left" type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
-              <Line yAxisId="left" type="monotone" dataKey="Actual" stroke="#1B8A3A" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
-              <Line yAxisId="right" type="monotone" dataKey="Budget GP%" stroke="#8A6D1A" strokeWidth={1.5} strokeDasharray="2 3" dot={false} />
-              <Line yAxisId="right" type="monotone" dataKey="Actual GP%" stroke="#C00000" strokeWidth={1.5} dot={{ r: 2.5 }} connectNulls={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </CollapsiblePanel>
+        <CollapsiblePanel title={`${periodLabel} Gross Profit — Actual vs Budget vs Forecast`}>
+          {(height) => (
+            <>
+              {/* Single $ axis only — GP% shown as a text callout instead of
+                  a second axis, per the redesign spec (a % axis on a $
+                  chart invites misreading the two series against each
+                  other). */}
+              <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
+                YTD GP% {fmtPct(kpis.actualGpPct)} vs budget {fmtPct(kpis.blendedGpPct)} · FY forecast GP% {fmtPct(kpis.forecastGpPct)}
+              </div>
+              {(viewMode === "yearly" && yearlyLoading) ? (
+                <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={height}>
+                  <LineChart data={gpChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
+                    <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
+                    <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+                    <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} cursor={{ stroke: "#1B8A3A", strokeDasharray: "3 3" }} />
+                    <Legend verticalAlign="bottom" />
+                    <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+                    <Line type="monotone" dataKey="Actual" stroke="#1B8A3A" strokeWidth={2.5} dot={actualEndpointDot(cutoffIdx, viewMode)} connectNulls={false} />
+                    {viewMode !== "yearly" && <Line type="monotone" dataKey="Forecast" stroke="#2E5FA3" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={false} />}
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </>
+          )}
+        </CollapsiblePanel>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginTop: 4, alignItems: "start" }}>
+        <KeyDriversPanel movers={movers} marginDetractors={marginDetractors} regionMovers={regionMovers} regionLoading={regionLoading} fmtN={fmtN} onNavigate={onNavigate} />
+        <RisksOpportunitiesPanel kpis={kpis} gpImpactEstimate={gpImpactEstimate} top3ConcentrationPct={top3ConcentrationPct} anomalyNote={anomalyNote} fmtN={fmtN} onNavigate={onNavigate} />
+      </div>
+
+      <div style={{ ...styles.panel, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div style={{ fontSize: 12.5, color: "#6B6B6B" }}>Drill down into Vendors or Regions to see what's driving the variance.</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => onNavigate("vendors")} style={styles.secondaryBtn}>Go to Vendors</button>
+          <button onClick={() => onNavigate("regions")} style={styles.secondaryBtn}>Go to Regions</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Auto-generated (deterministic, not AI) headline + 2-3 supporting facts +
+// clickable topic chips — revenue/GP topics only, no Cash Flow (that
+// module is fully out of scope for this page). Chips double as navigation
+// via onNavigate (App()'s setTab).
+function ManagementSnapshot({ kpis, needsAttentionTotal, fmtN, onNavigate }) {
+  const gpDiffPts = (kpis.actualGpPct - kpis.blendedGpPct) * 100;
+  const facts = [
+    { color: kpis.varAmt >= 0 ? "#1B8A3A" : "#C00000", text: `YTD revenue ${fmtSignedPct(kpis.varPct)} vs plan (${fmtN(kpis.varAmt)})` },
+    { color: gpDiffPts >= 0 ? "#1B8A3A" : "#8A6D1A", text: `GP% is ${Math.abs(gpDiffPts).toFixed(1)} pts ${gpDiffPts >= 0 ? "ahead of" : "behind"} budget` },
+    ...(needsAttentionTotal > 0 ? [{ color: "#C00000", text: `${needsAttentionTotal} vendor${needsAttentionTotal === 1 ? "" : "s"} need${needsAttentionTotal === 1 ? "s" : ""} attention` }] : []),
+  ];
+  const chips = [["Margins", "pl"], ["Vendors", "vendors"], ["Regions", "regions"]];
+  return (
+    <div style={{ ...styles.panel, marginBottom: 16 }}>
+      <div style={{ fontSize: 15, fontWeight: 600, fontFamily: "'Fraunces', serif", marginBottom: 10 }}>{buildSnapshotHeadline(kpis)}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 12 }}>
+        {facts.map((f, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#6B6B6B" }}>
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: f.color, flexShrink: 0 }} />
+            {f.text}
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {chips.map(([label, tabId]) => (
+          <button key={tabId} onClick={() => onNavigate(tabId)} style={{ ...styles.secondaryBtn, padding: "5px 12px", fontSize: 11.5 }}>{label}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Left column of the bottom section — three sub-columns of ranked
+// highlights (the "highlight reel," not the full Vendors/Regions pages).
+function KeyDriversPanel({ movers, marginDetractors, regionMovers, regionLoading, fmtN, onNavigate }) {
+  const MiniBar = ({ value, max, color }) => (
+    <div style={{ height: 4, borderRadius: 2, background: "#F0F0F0", marginTop: 4 }}>
+      <div style={{ height: 4, borderRadius: 2, width: `${max ? Math.min(100, Math.abs(value) / max * 100) : 0}%`, background: color }} />
+    </div>
+  );
+  const revenueContributors = [...movers].sort((a, b) => b.varAmt - a.varAmt).slice(0, 5);
+  const maxContributorAbs = Math.max(1, ...revenueContributors.map(v => Math.abs(v.varAmt)));
+  const maxDetractorPts = Math.max(1, ...marginDetractors.map(v => v.gpPtsBehind));
+  const maxRegionAbs = Math.max(1, ...(regionMovers || []).map(r => Math.abs(r.varAmt)));
+
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Key Drivers — YTD vs Plan</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 20 }}>
+        <div>
+          <div style={{ fontSize: 11.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 8 }}>TOP REVENUE CONTRIBUTORS</div>
+          {revenueContributors.length === 0 ? <div style={{ fontSize: 12, color: "#8A8A8A" }}>No data yet.</div> : revenueContributors.map(v => (
+            <div key={v.vendor} style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{v.vendor}</span>
+                <span className="num" style={{ color: v.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{v.varAmt >= 0 ? "+" : ""}{fmtN(v.varAmt)}</span>
+              </div>
+              <MiniBar value={v.varAmt} max={maxContributorAbs} color={v.varAmt >= 0 ? "#1B8A3A" : "#C00000"} />
+            </div>
+          ))}
+          <button onClick={() => onNavigate("vendors")} style={{ ...styles.secondaryBtn, background: "transparent", border: "none", padding: "4px 0", fontSize: 11.5, color: "#B4231E" }}>View all →</button>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 11.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 8 }}>TOP MARGIN DETRACTORS</div>
+          {marginDetractors.length === 0 ? <div style={{ fontSize: 12, color: "#8A8A8A" }}>None — no vendor is trailing its budgeted GP%.</div> : marginDetractors.map(v => (
+            <div key={v.vendor} style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{v.vendor}</span>
+                <span className="num" style={{ color: "#7A3F9A" }}>-{v.gpPtsBehind.toFixed(1)} pts</span>
+              </div>
+              <MiniBar value={v.gpPtsBehind} max={maxDetractorPts} color="#7A3F9A" />
+            </div>
+          ))}
+          <button onClick={() => onNavigate("vendors")} style={{ ...styles.secondaryBtn, background: "transparent", border: "none", padding: "4px 0", fontSize: 11.5, color: "#B4231E" }}>View all →</button>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 11.5, fontWeight: 600, color: "#6B6B6B", marginBottom: 8 }}>TOP REGIONS</div>
+          {regionLoading ? <div style={{ fontSize: 12, color: "#8A8A8A" }}>Loading…</div> : (regionMovers || []).length === 0 ? <div style={{ fontSize: 12, color: "#8A8A8A" }}>No data yet.</div> : regionMovers.map(r => (
+            <div key={r.name} style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{r.name}</span>
+                <span className="num" style={{ color: r.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{r.varAmt >= 0 ? "+" : ""}{fmtN(r.varAmt)}</span>
+              </div>
+              <MiniBar value={r.varAmt} max={maxRegionAbs} color={r.varAmt >= 0 ? "#1B8A3A" : "#C00000"} />
+            </div>
+          ))}
+          <button onClick={() => onNavigate("regions")} style={{ ...styles.secondaryBtn, background: "transparent", border: "none", padding: "4px 0", fontSize: 11.5, color: "#B4231E" }}>View all →</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Right column — a single severity-colored list, scoped to revenue/GP
+// drivers only. No pipeline/renewal item: there's no real data source for
+// that anywhere in this app's Firestore schema, and inventing one would
+// violate the same "never invent" principle the chat assistant follows.
+function RisksOpportunitiesPanel({ kpis, gpImpactEstimate, top3ConcentrationPct, anomalyNote, fmtN, onNavigate }) {
+  const items = [];
+  if (kpis.actualGpPct < kpis.blendedGpPct - 0.003) {
+    items.push({ severity: "warning", text: `GP margin is trailing budget by ${Math.abs((kpis.actualGpPct - kpis.blendedGpPct) * 100).toFixed(1)} pts — an estimated ${fmtN(gpImpactEstimate)} of GP at the current run rate.` });
+  }
+  if (top3ConcentrationPct >= 0.4) {
+    items.push({ severity: "warning", text: `Top 3 vendors make up ${(top3ConcentrationPct * 100).toFixed(0)}% of budgeted revenue — a concentration risk if any one of them slips.` });
+  }
+  if (anomalyNote) items.push({ severity: "good", text: anomalyNote });
+  if (kpis.varAmt >= 0 && kpis.actualGpPct >= kpis.blendedGpPct) {
+    items.push({ severity: "good", text: "Revenue and margin are both ahead of plan — no immediate risk flagged from this data." });
+  }
+  const colorFor = { critical: "#C00000", warning: "#8A6D1A", good: "#1B8A3A" };
+
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Risks & Opportunities</div>
+      {items.length === 0 ? (
+        <div style={{ fontSize: 12, color: "#8A8A8A", marginBottom: 12 }}>Nothing flagged from the current data.</div>
+      ) : items.map((it, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 12, fontSize: 12, lineHeight: 1.5 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", background: colorFor[it.severity], flexShrink: 0, marginTop: 4 }} />
+          <span style={{ color: "#333333" }}>{it.text}</span>
+        </div>
+      ))}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 14, paddingTop: 12, borderTop: "1px solid #E0E0E0" }}>
+        <button onClick={() => onNavigate("assumptions")} style={{ background: "transparent", border: "none", padding: 0, fontSize: 12, color: "#B4231E", textAlign: "left", cursor: "pointer" }}>View Assumptions →</button>
+        <button onClick={() => onNavigate("vendors")} style={{ background: "transparent", border: "none", padding: 0, fontSize: 12, color: "#B4231E", textAlign: "left", cursor: "pointer" }}>View Vendors →</button>
+      </div>
     </div>
   );
 }
