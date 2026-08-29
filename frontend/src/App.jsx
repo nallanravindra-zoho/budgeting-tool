@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info } from "lucide-react";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb } from "lucide-react";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
 import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
@@ -632,14 +632,6 @@ export default function App() {
     return stamps.length ? new Date(Math.max(...stamps.map(d => d.getTime()))) : null;
   }, [vendors]);
 
-  // Company-wide vendor status distribution — same computeVendorStatus
-  // used per-row on VendorPerformanceView, just counted here for
-  // Overview's Management Snapshot ("N vendors need attention").
-  const vendorStatusCounts = useMemo(() => {
-    const counts = { on_track: 0, watch: 0, needs_attention: 0, margin_risk: 0 };
-    scenarioVendors.forEach(v => { const s = computeVendorStatus(v); counts[s] = (counts[s] || 0) + 1; });
-    return counts;
-  }, [scenarioVendors]);
 
   const tableVendors = useMemo(() => {
     let rows = scenarioVendors.filter(v => v.vendor.toLowerCase().includes(search.toLowerCase()));
@@ -988,7 +980,6 @@ export default function App() {
             <OverviewTab
               kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
               year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab}
-              vendorStatusCounts={vendorStatusCounts}
             />
           )}
           {effectiveTab === "vendors" && (
@@ -1360,7 +1351,7 @@ function actualEndpointDot(cutoffIdx, viewMode) {
   };
 }
 
-function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, vendorStatusCounts }) {
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate }) {
   const { fmtN, unit } = useNumberUnit();
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
   const [yearlyRaw, setYearlyRaw] = useState(null);
@@ -1469,12 +1460,9 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
   const gpChartData = viewMode === "monthly" ? monthlyGpData : viewMode === "quarterly" ? quarterlyGpData : yearlyGpData;
   const periodLabel = { monthly: "Monthly", quarterly: "Quarterly", yearly: "By Year (last 5 years)" }[viewMode];
   const cutoffIdx = getActualCutoffMonthIndex(year);
-  const needsAttentionTotal = (vendorStatusCounts?.needs_attention || 0) + (vendorStatusCounts?.margin_risk || 0);
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
-      <ManagementSnapshot kpis={kpis} needsAttentionTotal={needsAttentionTotal} fmtN={fmtN} onNavigate={onNavigate} />
-
       <div style={styles.kpiGrid}>
         <KpiCard
           label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)}
@@ -1500,6 +1488,8 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
           pill={gpOutlook(kpis.gpForecastVarPts, "budget margin").text} pillTier={gpOutlook(kpis.gpForecastVarPts, "budget margin").tier}
         />
       </div>
+
+      <ManagementSnapshot kpis={kpis} marginDetractors={marginDetractors} fmtN={fmtN} onNavigate={onNavigate} />
 
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
         <div style={styles.plViewToggle}>
@@ -1536,11 +1526,11 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
                   gap called out in red/green. Bar+line combo with GP% on
                   its own right-hand axis, matching the reference layout. */}
               <div style={{ display: "flex", justifyContent: "flex-end", gap: 28, marginBottom: 8 }}>
-                <div style={{ textAlign: "right" }}>
+                <div style={{ textAlign: "left" }}>
                   <div style={{ fontSize: 10.5, color: "#8A8A8A" }}>YTD GP%</div>
                   <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>{fmtPct(kpis.actualGpPct)}</div>
                 </div>
-                <div style={{ textAlign: "right" }}>
+                <div style={{ textAlign: "left" }}>
                   <div style={{ fontSize: 10.5, color: "#8A8A8A" }}>vs Budget GP%</div>
                   <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>
                     {fmtPct(kpis.blendedGpPct)}{" "}
@@ -1593,29 +1583,87 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
 // clickable topic chips — revenue/GP topics only, no Cash Flow (that
 // module is fully out of scope for this page). Chips double as navigation
 // via onNavigate (App()'s setTab).
-function ManagementSnapshot({ kpis, needsAttentionTotal, fmtN, onNavigate }) {
+// Per-chip colors for "What needs attention" — a rotating identity palette
+// (not a severity ramp like KPI_TIER_COLORS), matching the mockup.
+// NOTE: Cash Flow is included here per an explicit mockup screenshot the
+// user provided — this reverses the original redesign spec's "no cash
+// flow chip" scope decision (Cash Flow is its own tab, deliberately kept
+// out of Overview everywhere else on this page). Flagged to the user;
+// remove this chip if that was unintentional.
+const SNAPSHOT_CHIP_COLORS = {
+  Margins: { fg: "#C0392B", bg: "#FBE3E1" },
+  Vendors: { fg: "#9A6B12", bg: "#FFF3DC" },
+  Regions: { fg: "#2E5FA3", bg: "#E3ECFB" },
+  "Cash Flow": { fg: "#1B8A3A", bg: "#E8F5E9" },
+};
+
+function ManagementSnapshot({ kpis, marginDetractors, fmtN, onNavigate }) {
   const gpDiffPts = (kpis.actualGpPct - kpis.blendedGpPct) * 100;
+  const revTier = revenueOutlook(kpis.varPct, "plan").tier;
+  const gpTier = gpOutlook(gpDiffPts, "budget").tier;
+  // Real driver data (marginDetractors, ranked by GP-pts-behind-budget —
+  // see App()) rather than an invented example like "Services & 2 key
+  // vendors" — names the actual vendor(s) responsible, or says plainly
+  // that nothing stands out, per the app's "never invent" convention.
+  const topDetractors = marginDetractors.slice(0, 2).map(v => v.vendor);
+  const driverTier = topDetractors.length ? "bad" : "good";
+  const driverText = topDetractors.length === 0
+    ? "No single vendor is driving the margin gap — it's spread across the portfolio."
+    : topDetractors.length === 1
+      ? `Margin gap is mainly driven by ${topDetractors[0]}.`
+      : `Margin gap is mainly driven by ${topDetractors[0]} & ${topDetractors[1]}.`;
+
   const facts = [
-    { color: kpis.varAmt >= 0 ? "#1B8A3A" : "#C00000", text: `YTD revenue ${fmtSignedPct(kpis.varPct)} vs plan (${fmtN(kpis.varAmt)})` },
-    { color: gpDiffPts >= 0 ? "#1B8A3A" : "#8A6D1A", text: `GP% is ${Math.abs(gpDiffPts).toFixed(1)} pts ${gpDiffPts >= 0 ? "ahead of" : "behind"} budget` },
-    ...(needsAttentionTotal > 0 ? [{ color: "#C00000", text: `${needsAttentionTotal} vendor${needsAttentionTotal === 1 ? "" : "s"} need${needsAttentionTotal === 1 ? "s" : ""} attention` }] : []),
+    {
+      tier: revTier, Icon: kpis.varAmt >= 0 ? TrendingUp : TrendingDown,
+      node: <>Revenue is <b>{fmtN(Math.abs(kpis.varAmt))}</b> {kpis.varAmt >= 0 ? "ahead of" : "behind"} YTD plan (<b style={{ color: KPI_TIER_COLORS[revTier].fg }}>{fmtSignedPct(kpis.varPct)}</b>).</>,
+    },
+    {
+      tier: gpTier, Icon: gpDiffPts >= 0 ? TrendingUp : AlertTriangle,
+      node: <>Realized GP% is <b>{fmtPct(kpis.actualGpPct)}</b> vs {fmtPct(kpis.blendedGpPct)} budget (<b style={{ color: KPI_TIER_COLORS[gpTier].fg }}>{gpDiffPts >= 0 ? "+" : ""}{gpDiffPts.toFixed(1)} pts</b>).</>,
+    },
+    { tier: driverTier, Icon: Target, node: driverText },
   ];
-  const chips = [["Margins", "pl"], ["Vendors", "vendors"], ["Regions", "regions"]];
+  const chips = [["Margins", "pl"], ["Vendors", "vendors"], ["Regions", "regions"], ["Cash Flow", "cashFlow"]];
+
   return (
     <div style={{ ...styles.panel, marginBottom: 16 }}>
-      <div style={{ fontSize: 15, fontWeight: 600, fontFamily: "'Fraunces', serif", marginBottom: 10 }}>{buildSnapshotHeadline(kpis)}</div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 12 }}>
-        {facts.map((f, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#6B6B6B" }}>
-            <span style={{ width: 7, height: 7, borderRadius: "50%", background: f.color, flexShrink: 0 }} />
-            {f.text}
-          </div>
-        ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+        <div style={{ width: 26, height: 26, borderRadius: "50%", background: "#FBE3E1", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <Lightbulb size={13} color="#C0392B" />
+        </div>
+        <div style={{ fontSize: 11, fontWeight: 600, color: "#8A8A8A", letterSpacing: "0.04em" }}>MANAGEMENT SNAPSHOT</div>
       </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-        {chips.map(([label, tabId]) => (
-          <button key={tabId} onClick={() => onNavigate(tabId)} style={{ ...styles.secondaryBtn, padding: "5px 12px", fontSize: 11.5 }}>{label}</button>
-        ))}
+      <div style={{ fontSize: 16, fontWeight: 600, fontFamily: "'Fraunces', serif", marginBottom: 14 }}>{buildSnapshotHeadline(kpis)}</div>
+
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 20, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, flex: 1, minWidth: 280, flexWrap: "wrap" }}>
+          {facts.map((f, i) => (
+            <React.Fragment key={i}>
+              {i > 0 && <div style={{ width: 1, height: 30, background: "#E0E0E0", flexShrink: 0 }} />}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#333333", maxWidth: 260 }}>
+                <div style={{ width: 26, height: 26, borderRadius: "50%", background: KPI_TIER_COLORS[f.tier].bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <f.Icon size={13} color={KPI_TIER_COLORS[f.tier].fg} />
+                </div>
+                <span>{f.node}</span>
+              </div>
+            </React.Fragment>
+          ))}
+        </div>
+        <div style={{ width: 1, alignSelf: "stretch", background: "#E0E0E0", flexShrink: 0 }} />
+        <div>
+          <div style={{ fontSize: 10.5, color: "#8A8A8A", marginBottom: 8 }}>What needs attention</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {chips.map(([label, tabId]) => (
+              <button
+                key={tabId} onClick={() => onNavigate(tabId)}
+                style={{ border: "none", borderRadius: 20, padding: "6px 14px", fontSize: 11.5, fontWeight: 600, cursor: "pointer", color: SNAPSHOT_CHIP_COLORS[label].fg, background: SNAPSHOT_CHIP_COLORS[label].bg }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
