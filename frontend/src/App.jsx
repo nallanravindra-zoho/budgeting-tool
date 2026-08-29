@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb } from "lucide-react";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb, MoreVertical, Download } from "lucide-react";
+import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
 import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
@@ -1497,12 +1498,31 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
 
       <ManagementSnapshot kpis={kpis} marginDetractors={marginDetractors} fmtN={fmtN} onNavigate={onNavigate} />
 
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginBottom: 10 }}>
         <div style={styles.plViewToggle}>
           {[["monthly", "Monthly"], ["quarterly", "Quarterly"], ["yearly", "Yearly"]].map(([k, label]) => (
             <button key={k} onClick={() => setViewMode(k)} style={{ ...styles.plToggleBtn, ...(viewMode === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
           ))}
         </div>
+        <ExportMenu
+          getSheets={() => {
+            const rows = chartData.map((r, i) => ({
+              month: r.month, budgetRev: r.Budget, actualRev: r.Actual, forecastRev: r.Forecast,
+              budgetGp: gpChartData[i]?.Budget, actualGp: gpChartData[i]?.Actual, forecastGp: gpChartData[i]?.Forecast,
+              budgetGpPct: gpChartData[i]?.["Budget GP%"], actualGpPct: gpChartData[i]?.["Actual GP%"],
+            }));
+            return [{
+              name: "Revenue & GP",
+              columns: [
+                { key: "month", label: "Period" }, { key: "budgetRev", label: "Budget Revenue" }, { key: "actualRev", label: "Actual Revenue" }, { key: "forecastRev", label: "Forecast Revenue" },
+                { key: "budgetGp", label: "Budget GP" }, { key: "actualGp", label: "Actual GP" }, { key: "forecastGp", label: "Forecast GP" },
+                { key: "budgetGpPct", label: "Budget GP%" }, { key: "actualGpPct", label: "Actual GP%" },
+              ],
+              rows,
+            }];
+          }}
+          filename={`overview-${viewMode}`}
+        />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -1750,6 +1770,16 @@ function VendorsTab({ rows, search, setSearch, sortKey, sortDir, toggleSort, edi
     for (const v of rows) { t.budget_revenue += v.budget_revenue; t.budget_gp += v.budget_gp; }
     return { ...t, budget_gp_pct: t.budget_revenue ? t.budget_gp / t.budget_revenue : 0 };
   }, [rows]);
+  const getExportSheets = () => [{
+    name: "Vendors",
+    columns: [
+      { key: "vendor", label: "Vendor" },
+      { key: "budget_revenue", label: "Budget Revenue" },
+      { key: "budget_gp", label: "Budget GP" },
+      { key: "gp_pct", label: "GP%", value: v => fmtPct(v.gp_pct) },
+    ],
+    rows,
+  }];
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
@@ -1764,6 +1794,7 @@ function VendorsTab({ rows, search, setSearch, sortKey, sortDir, toggleSort, edi
           {isEditableYear && (
             <button onClick={onAddVendorClick} style={styles.planBtn}>+ Add Vendor</button>
           )}
+          <ExportMenu getSheets={getExportSheets} filename={`vendors-budget-${activeBudgetingYear}`} />
         </div>
       </div>
       <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>
@@ -1914,6 +1945,20 @@ function PLTab({ alloc }) {
   const companyGpPct = alloc.totalGP ? alloc.totalGP / alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0) : 0;
   const totalRevenue = alloc.monthlyPL.reduce((s, m) => s + m.revenue, 0);
 
+  // Exports whichever of the 3 tables the `view` toggle currently shows —
+  // same figures on screen, in file form.
+  const getExportSheets = () => {
+    const gpPctCol = { key: "gpPct", label: "GP%", value: r => fmtPct(r.revenue ? r.gp / r.revenue : 0) };
+    const ebidPctCol = { key: "ebidPct", label: "EBID%", value: r => fmtPct(r.revenue ? r.ebid / r.revenue : 0) };
+    if (view === "monthly") {
+      return [{ name: "Monthly P&L", columns: [{ key: "month", label: "Month" }, { key: "revenue", label: "Revenue" }, { key: "gp", label: "GP" }, gpPctCol, { key: "sga", label: "SGA" }, { key: "ebid", label: "EBID" }, ebidPctCol], rows: alloc.monthlyPL }];
+    }
+    if (view === "vendor") {
+      return [{ name: "Vendor-wise EBID", columns: [{ key: "vendor", label: "Vendor" }, { key: "revenue", label: "Budget Rev" }, { key: "gp", label: "Budget GP" }, { key: "sga", label: "SGA Allocated" }, { key: "ebid", label: "EBID" }, ebidPctCol], rows: alloc.vendorPL }];
+    }
+    return [{ name: "Country-wise EBID", columns: [{ key: "region", label: "Country" }, { key: "revenue", label: "Budget Rev" }, { key: "gp", label: "Budget GP" }, { key: "sga", label: "SGA Allocated" }, { key: "ebid", label: "EBID" }, ebidPctCol], rows: alloc.countryPL }];
+  };
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={styles.kpiGrid}>
@@ -1923,10 +1968,13 @@ function PLTab({ alloc }) {
         <KpiCard label="Blended GP% → EBID%" value={fmtPct(companyGpPct)} sub={`down to ${fmtPct(totalRevenue ? alloc.totalEbid / totalRevenue : 0)} EBID%`} />
       </div>
 
-      <div style={styles.plViewToggle}>
-        {[["monthly", "Monthly (Company)"], ["vendor", "Vendor-wise"], ["country", "Country-wise"]].map(([k, label]) => (
-          <button key={k} onClick={() => setView(k)} style={{ ...styles.plToggleBtn, ...(view === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
-        ))}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ ...styles.plViewToggle, marginBottom: 0 }}>
+          {[["monthly", "Monthly (Company)"], ["vendor", "Vendor-wise"], ["country", "Country-wise"]].map(([k, label]) => (
+            <button key={k} onClick={() => setView(k)} style={{ ...styles.plToggleBtn, ...(view === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
+          ))}
+        </div>
+        <ExportMenu getSheets={getExportSheets} filename={`pl-ebid-${view}`} />
       </div>
 
       {view === "monthly" && (
@@ -2138,6 +2186,31 @@ function OtherExpensesTab({ showToast, year, isEditableYear, activeBudgetingYear
 
   const grandTotal = rollup.reduce((s, c) => s + c.total, 0);
 
+  const getCategoryExportSheets = () => {
+    const flat = [];
+    rollup.forEach(cat => {
+      flat.push({ category: cat.name, subcategory: "", monthly: cat.monthly, total: cat.total });
+      (cat.subcategories || []).forEach(sub => flat.push({ category: cat.name, subcategory: sub.name, monthly: sub.monthly, total: sub.total }));
+    });
+    return [{
+      name: "Categories",
+      columns: [
+        { key: "category", label: "Category" }, { key: "subcategory", label: "Subcategory" },
+        ...MONTHS.map((m, i) => ({ key: `m${i}`, label: m, value: r => r.monthly[i] })),
+        { key: "total", label: "Total" },
+      ],
+      rows: flat,
+    }];
+  };
+  const getUnmappedExportSheets = () => [{
+    name: "Unmapped Accounts",
+    columns: [
+      { key: "entity", label: "Entity" }, { key: "glCode", label: "GL Code" },
+      { key: "glName", label: "Account Name" }, { key: "type", label: "Type" },
+    ],
+    rows: unmapped,
+  }];
+
   const handleSetGrowth = async (categoryId, pct) => {
     try {
       await setGrowthAssumption(year, categoryId, pct);
@@ -2214,7 +2287,10 @@ function OtherExpensesTab({ showToast, year, isEditableYear, activeBudgetingYear
       </div>
 
       <div style={styles.panel}>
-        <div style={styles.panelTitle}>Categories — {year} Actuals by Month</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={styles.panelTitle}>Categories — {year} Actuals by Month</div>
+          <ExportMenu getSheets={getCategoryExportSheets} filename={`other-expenses-categories-${year}`} />
+        </div>
         {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : rollup.length === 0 || grandTotal === 0 ? (
           <div style={{ fontSize: 12, color: "#6B6B6B" }}>
             No mapped actuals for {year} yet. {topLevelCategories.length === 0 ? 'Click "Sync Ledger" above to pull data and auto-create categories from Grouping.' : "Map the accounts below to see them roll up here."}
@@ -2291,7 +2367,10 @@ function OtherExpensesTab({ showToast, year, isEditableYear, activeBudgetingYear
       </div>
 
       <div style={styles.panel}>
-        <div style={styles.panelTitle}>Unmapped GL Accounts {unmapped.length > 0 && `(${unmapped.length})`}</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={styles.panelTitle}>Unmapped GL Accounts {unmapped.length > 0 && `(${unmapped.length})`}</div>
+          <ExportMenu getSheets={getUnmappedExportSheets} filename={`unmapped-gl-accounts-${year}`} />
+        </div>
         <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 10 }}>Accounts with no Grouping value in Zoho — these need a category assigned manually.</div>
         {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : unmapped.length === 0 ? (
           <div style={{ fontSize: 12, color: "#1B8A3A" }}>✓ Every synced GL account is mapped to a category.</div>
@@ -2457,12 +2536,25 @@ function AgreementsView({ agreements, categories, topLevelCategories, subcategor
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState(null); // agreement object being edited, or null for "new"
   const categoryName = (id) => categories.find(c => c.id === id)?.name || "(uncategorized)";
+  const getExportSheets = () => [{
+    name: "Agreements",
+    columns: [
+      { key: "type", label: "Type" }, { key: "name", label: "Name" }, { key: "entity", label: "Entity", value: a => a.entity || "" },
+      { key: "category", label: "Category", value: a => categoryName(a.categoryId) },
+      { key: "amount", label: "Amount", value: a => a.monthlyRent || a.monthlyAmount || a.fee || 0 },
+      { key: "active", label: "Active", value: a => a.activeFlag ? "Active" : "Inactive" },
+    ],
+    rows: agreements,
+  }];
 
   return (
     <div style={styles.panel}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
         <div style={styles.panelTitle}>Rent / Consultant / Subscription Agreements</div>
-        <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Agreement</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Agreement</button>
+          <ExportMenu getSheets={getExportSheets} filename="expense-agreements" />
+        </div>
       </div>
       <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
         An active agreement takes precedence over the trend calculation for its category — its terms drive the budget number directly.
@@ -2667,19 +2759,44 @@ function BudgetVarianceView({ year, isEditableYear, activeBudgetingYear, budgetL
   const totalBudget = totals.budget.reduce((a, b) => a + b, 0);
   const totalActual = totals.actual.reduce((a, b) => a + b, 0);
 
+  const getExportSheets = () => {
+    const rows = budgetLines.map(line => {
+      const actual = actualsByLineId[line.id] || new Array(12).fill(0);
+      const budget = line.monthlyAmount || new Array(12).fill(0);
+      return {
+        name: lineName(line), source: line.source, budget, actual,
+        budgetTotal: budget.reduce((a, b) => a + b, 0), actualTotal: actual.reduce((a, b) => a + b, 0),
+      };
+    });
+    return [{
+      name: "Budget & Variance",
+      columns: [
+        { key: "name", label: "Category" }, { key: "source", label: "Source" },
+        ...MONTHS.map((m, i) => ({ key: `b${i}`, label: `Budget ${m}`, value: r => r.budget[i] })),
+        ...MONTHS.map((m, i) => ({ key: `a${i}`, label: `Actual ${m}`, value: r => r.actual[i] })),
+        ...MONTHS.map((m, i) => ({ key: `v${i}`, label: `Variance ${m}`, value: r => r.actual[i] - r.budget[i] })),
+        { key: "budgetTotal", label: "Budget Total" }, { key: "actualTotal", label: "Actual Total" },
+      ],
+      rows,
+    }];
+  };
+
   return (
     <div style={styles.panel}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
         <div style={styles.panelTitle}>Budget vs Actual \u2014 {year}</div>
-        {isEditableYear ? (
-          <button onClick={onGenerate} disabled={generating} style={styles.primaryBtn}>
-            {generating ? "Generating\u2026" : budgetLines.length > 0 ? "Regenerate Budget" : "Generate Budget"}
-          </button>
-        ) : (
-          <span style={{ fontSize: 11.5, color: "#8A6D1A", background: "#FFF8E1", border: "1px solid #E8C468", borderRadius: 6, padding: "3px 8px" }}>
-            Read-only \u2014 budget generation/editing is only enabled for {activeBudgetingYear}.
-          </span>
-        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {isEditableYear ? (
+            <button onClick={onGenerate} disabled={generating} style={styles.primaryBtn}>
+              {generating ? "Generating\u2026" : budgetLines.length > 0 ? "Regenerate Budget" : "Generate Budget"}
+            </button>
+          ) : (
+            <span style={{ fontSize: 11.5, color: "#8A6D1A", background: "#FFF8E1", border: "1px solid #E8C468", borderRadius: 6, padding: "3px 8px" }}>
+              Read-only \u2014 budget generation/editing is only enabled for {activeBudgetingYear}.
+            </span>
+          )}
+          <ExportMenu getSheets={getExportSheets} filename={`other-expenses-budget-variance-${year}`} />
+        </div>
       </div>
       <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
         Budget = an active agreement's terms where one exists, else last year's actual \u00d7 growth%, shaped to last year's own monthly pattern. Click a budget figure to override it manually \u2014 the original system estimate is kept even after an override.
@@ -2850,6 +2967,19 @@ function EmployeesTab({ showToast, year }) {
 
   const stats = employees.length ? computeEmployeeDashboardStats(employees, year) : null;
 
+  const getExportSheets = () => {
+    const rows = filtered.map(e => ({ ...e, monthly: computeEmployeeMonthlyCost(e, year) }));
+    return [{
+      name: "Employees",
+      columns: [
+        { key: "name", label: "Name" }, { key: "employeeNo", label: "Employee No" }, { key: "department", label: "Department" },
+        ...MONTHS.map((m, i) => ({ key: `m${i}`, label: m, value: r => r.monthly[i] })),
+        { key: "total", label: "Total", value: r => r.monthly.reduce((a, b) => a + b, 0) },
+      ],
+      rows,
+    }];
+  };
+
   const handleSaveEmployee = async (fields) => {
     try {
       if (editingEmployee) await updateEmployee(editingEmployee.id, fields);
@@ -2983,6 +3113,7 @@ function EmployeesTab({ showToast, year }) {
               <option value="resigned">Resigned</option>
               <option value="all">All</option>
             </select>
+            <ExportMenu getSheets={getExportSheets} filename={`employees-${year}`} />
           </div>
         </div>
 
@@ -3447,6 +3578,31 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
     };
   }, [filtered, budgetKey, ytdBudgetKey, actualKey, fyForecastKey, completed]);
 
+  // Export columns mirror exactly what the table below renders for the
+  // current isBudgetingOrFuture/completed branch — same figures on screen,
+  // just in file form.
+  const getExportSheets = () => {
+    const cols = [{ key: "vendor", label: "Vendor" }];
+    if (isBudgetingOrFuture) {
+      cols.push({ key: budgetKey, label: "FY Budget" });
+    } else {
+      if (!completed) cols.push({ key: "status", label: "Status", value: v => STATUS_LABELS[v.status] });
+      cols.push({ key: budgetKey, label: "FY Budget" });
+      if (!completed) cols.push({ key: ytdBudgetKey, label: "YTD Budget" });
+      cols.push({ key: actualKey, label: completed ? "FY Actual" : "YTD Actual" });
+      cols.push({ key: "balanceToDo", label: "Balance to Do", value: v => v[budgetKey] - v[actualKey] });
+      cols.push({ key: completed ? fyVarKey : varKey, label: completed ? "FY Var" : "YTD Var" });
+      cols.push({ key: completed ? fyVarPctKey : varPctKey, label: completed ? "FY Var %" : "YTD Var %", value: v => fmtSignedPct(v[completed ? fyVarPctKey : varPctKey]) });
+      if (!completed) {
+        cols.push({ key: fyForecastKey, label: "FY Forecast (System)" });
+        cols.push({ key: "mgmtForecast", label: "Mgmt Forecast" });
+        cols.push({ key: forecastVarKey, label: "Forecast Var" });
+        cols.push({ key: forecastVarPctKey, label: "Forecast Var %", value: v => fmtSignedPct(v[forecastVarPctKey]) });
+      }
+    }
+    return [{ name: "Vendors", columns: cols, rows: filtered }];
+  };
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
@@ -3525,6 +3681,7 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
           <button onClick={() => setSortDir(d => d === "asc" ? "desc" : "asc")} style={styles.iconBtnGhost} title="Reverse sort direction">
             <ChevronDown size={14} style={{ transform: sortDir === "asc" ? "none" : "rotate(180deg)" }} />
           </button>
+          <ExportMenu getSheets={getExportSheets} filename={`vendors-${year}`} />
         </div>
       </div>
 
@@ -3710,6 +3867,42 @@ function StatusBadge({ status }) {
       {Icon && <Icon size={10} />}
       {STATUS_LABELS[status]}
     </span>
+  );
+}
+
+// Small hidden "⋮" export menu — CSV/Excel, no import (yet). `getSheets`
+// is called lazily on click (not on every render) and must return
+// exportUtils.js's `sheets` shape: [{ name, columns: [{key,label,value?}], rows }].
+// `filename` is the base name (date-stamped automatically by exportUtils).
+function ExportMenu({ getSheets, filename }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [open]);
+  const run = (fn) => {
+    fn(getSheets(), filename);
+    setOpen(false);
+  };
+  return (
+    <div ref={ref} style={{ position: "relative", display: "inline-block" }}>
+      <button onClick={() => setOpen(o => !o)} style={styles.iconBtnGhost} title="Export this data">
+        <MoreVertical size={15} />
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "calc(100% + 4px)", right: 0, background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, boxShadow: "0 4px 16px rgba(0,0,0,0.12)", zIndex: 30, minWidth: 150, overflow: "hidden" }}>
+          <button onClick={() => run(exportSheetsAsCsv)} style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 12px", fontSize: 12.5, background: "transparent", border: "none", cursor: "pointer", textAlign: "left", color: "#111111" }}>
+            <Download size={13} /> Export CSV
+          </button>
+          <button onClick={() => run(exportSheetsAsExcel)} style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 12px", fontSize: 12.5, background: "transparent", border: "none", cursor: "pointer", textAlign: "left", color: "#111111", borderTop: "1px solid #F0F0F0" }}>
+            <Download size={13} /> Export Excel
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -4033,6 +4226,28 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
     };
   }, [filtered, budgetKey, ytdBudgetKey, actualKey, fyForecastKey, completed]);
 
+  // Mirrors the table's own column visibility — no Balance to Do or Mgmt
+  // Forecast here, since neither exists on the rendered Region table.
+  const getExportSheets = () => {
+    const cols = [{ key: "name", label: granularityLabel[granularity] }];
+    if (isBudgetingOrFuture) {
+      cols.push({ key: budgetKey, label: "FY Budget" });
+    } else {
+      if (!completed) cols.push({ key: "status", label: "Status", value: r => STATUS_LABELS[r.status] });
+      cols.push({ key: budgetKey, label: "FY Budget" });
+      if (!completed) cols.push({ key: ytdBudgetKey, label: "YTD Budget" });
+      cols.push({ key: actualKey, label: completed ? "FY Actual" : "YTD Actual" });
+      cols.push({ key: completed ? fyVarKey : varKey, label: completed ? "FY Var" : "YTD Var" });
+      cols.push({ key: completed ? fyVarPctKey : varPctKey, label: completed ? "FY Var %" : "YTD Var %", value: r => fmtSignedPct(r[completed ? fyVarPctKey : varPctKey]) });
+      if (!completed) {
+        cols.push({ key: fyForecastKey, label: "FY Forecast (System)" });
+        cols.push({ key: forecastVarKey, label: "Forecast Var" });
+        cols.push({ key: forecastVarPctKey, label: "Forecast Var %", value: r => fmtSignedPct(r[forecastVarPctKey]) });
+      }
+    }
+    return [{ name: granularityLabel[granularity], columns: cols, rows: filtered }];
+  };
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
@@ -4053,6 +4268,7 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
               <button key={val} onClick={() => setMetricView(val)} style={{ ...styles.unitToggleBtn, ...(metricView === val ? styles.unitToggleBtnActive : {}) }}>{label}</button>
             ))}
           </div>
+          <ExportMenu getSheets={getExportSheets} filename={`regions-${granularity}-${year}`} />
         </div>
       </div>
 
@@ -4341,13 +4557,25 @@ function AssumptionsTab({ showToast, skoUplift }) {
   const otherItems = assumptions.filter(a => !ASSUMPTION_CATEGORIES.includes(a.category));
   if (otherItems.length) grouped.push({ category: "Other", items: otherItems });
 
+  const getExportSheets = () => [{
+    name: "Assumptions",
+    columns: [
+      { key: "category", label: "Category" }, { key: "label", label: "Label" },
+      { key: "value", label: "Value" }, { key: "unit", label: "Unit" }, { key: "description", label: "Description" },
+    ],
+    rows: assumptions,
+  }];
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
         <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>
           A single place to see and edit the assumptions and data sources this app runs on — useful for a quick "what's this built on" review. Example/placeholder values below, not finalized finance policy.
         </div>
-        <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Assumption</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Assumption</button>
+          <ExportMenu getSheets={getExportSheets} filename="assumptions" />
+        </div>
       </div>
 
       {formOpen && <AssumptionFormModal initial={editing} onCancel={() => { setFormOpen(false); setEditing(null); }} onSave={handleSave} />}
@@ -4488,10 +4716,22 @@ function OperationalStatsTab({ showToast, year }) {
   if (loading) return <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading operational stats for {year} (and prior years, to compute what's new)…</div>;
   if (!stats) return null;
 
+  // 4 sheets — the page has 4 chart-backed arrays, no single table. Excel
+  // gets them as 4 tabs; CSV concatenates them as labeled sections.
+  const getExportSheets = () => [
+    { name: "Revenue Buckets", columns: [{ key: "label", label: "Deal Size" }, { key: "count", label: "Deals" }, { key: "revenue", label: "Revenue" }], rows: stats.revenueBuckets },
+    { name: "GP Buckets", columns: [{ key: "label", label: "GP% Range" }, { key: "count", label: "Deals" }, { key: "revenue", label: "Revenue" }], rows: stats.gpBuckets },
+    { name: "Segments", columns: [{ key: "name", label: "Segment" }, { key: "revenue", label: "Revenue" }, { key: "count", label: "Deals" }], rows: stats.segments },
+    { name: "Multi-Year Trend", columns: [{ key: "year", label: "Year" }, { key: "Invoices", label: "Invoices" }, { key: "Vendors", label: "Vendors" }, { key: "Customers", label: "Customers" }, { key: "End Customers", label: "End Customers" }, { key: "Countries", label: "Countries" }], rows: stats.trend },
+  ];
+
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
-      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 14 }}>
-        Computed from raw invoice-level actuals (CIPR) for {year}. "New this year" compares against every prior year synced (2023 onward) — an entity only counts as new if it's never appeared before.
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>
+          Computed from raw invoice-level actuals (CIPR) for {year}. "New this year" compares against every prior year synced (2023 onward) — an entity only counts as new if it's never appeared before.
+        </div>
+        <ExportMenu getSheets={getExportSheets} filename={`operational-stats-${year}`} />
       </div>
 
       <div style={styles.kpiGrid}>
@@ -4634,6 +4874,14 @@ function CashFlowTab({ showToast, year }) {
   const { periods, currentIndex, kpis, agedAR, agedAP } = cf;
   const chartData = periods.map((p) => ({ label: p.label, AR: p.ar, AP: -p.ap, Net: p.net }));
   const currentLabel = periods[currentIndex]?.label;
+  const getExportSheets = () => [{
+    name: "Period Ledger",
+    columns: [
+      { key: "label", label: "Period" }, { key: "ar", label: "AR Due" }, { key: "ap", label: "AP Due" },
+      { key: "net", label: "Net" }, { key: "status", label: "Status", value: p => p.isSurplus ? "Surplus" : "Deficit" },
+    ],
+    rows: periods,
+  }];
   // Visual scale only — bars read relative to a 90-day reference, not a
   // hard max (an actual figure above 90 just fills the track).
   const scalePct = (days) => Math.max(4, Math.min(100, Math.round(((days || 0) / 90) * 100)));
@@ -4661,6 +4909,7 @@ function CashFlowTab({ showToast, year }) {
             <RefreshCw size={12} style={{ marginRight: 5, ...(syncing ? { animation: "spin 1s linear infinite" } : {}) }} />
             {syncing ? "Syncing…" : `Sync Bills ${year}`}
           </button>
+          <ExportMenu getSheets={getExportSheets} filename={`cash-flow-${granularity}`} />
         </div>
       </div>
 
@@ -4857,7 +5106,13 @@ function VersionsTab({ versions, onLoad, onSaveClick, activeBudgetingYear, showT
       </div>
 
       <div style={styles.panel}>
-        <div style={styles.panelTitle}>Saved Budget Versions</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={styles.panelTitle}>Saved Budget Versions</div>
+          <ExportMenu
+            getSheets={() => [{ name: "Versions", columns: [{ key: "name", label: "Name" }, { key: "created_at", label: "Created", value: v => new Date(v.created_at).toLocaleString() }], rows: versions }]}
+            filename="budget-versions"
+          />
+        </div>
         <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>Versions are shared across everyone using this tool. Save a snapshot before making major edits so it can be recalled later.</div>
         {versions.length === 0 ? (
           <div style={styles.emptyState}><div style={{ fontSize: 14, marginBottom: 10 }}>No versions saved yet.</div><button onClick={onSaveClick} style={styles.primaryBtn}><Save size={14} style={{ marginRight: 6 }} />Save current state</button></div>
