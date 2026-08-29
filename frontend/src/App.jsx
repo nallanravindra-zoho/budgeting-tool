@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb, MoreVertical, Download } from "lucide-react";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb, MoreVertical, Download, Presentation } from "lucide-react";
 import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
+import { exportOverviewToPpt } from "./pptExport.js";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, updateVersion as updateVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
 import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
@@ -546,9 +547,11 @@ export default function App() {
   // Per-vendor FY System Forecast (run-rate method) — same function
   // VendorPerformanceView already uses per-row; computed once here too so
   // Overview can show a company-wide FY Forecast without re-deriving the
-  // run-rate math itself.
+  // run-rate math itself. `status` added alongside (also computeVendorStatus,
+  // same as VendorPerformanceView) so this one array is also enough for the
+  // PPT export's Vendor-wise slide — no separate fetch/enrichment needed.
   const enrichedVendors = useMemo(() =>
-    scenarioVendors.map(v => ({ ...v, ...computeFySystemForecast(v, year) })),
+    scenarioVendors.map(v => ({ ...v, ...computeFySystemForecast(v, year), status: computeVendorStatus(v) })),
     [scenarioVendors, year]
   );
 
@@ -1013,7 +1016,7 @@ export default function App() {
           {effectiveTab === "overview" && (
             <OverviewTab
               kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
-              year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab}
+              year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab} enrichedVendors={enrichedVendors} showToast={showToast}
             />
           )}
           {effectiveTab === "vendors" && (
@@ -1392,13 +1395,16 @@ function actualEndpointDot(cutoffIdx, viewMode) {
   };
 }
 
-function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate }) {
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, enrichedVendors, showToast }) {
   const { fmtN, unit } = useNumberUnit();
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
   const [yearlyRaw, setYearlyRaw] = useState(null);
   const [yearlyLoading, setYearlyLoading] = useState(false);
   const [regionMovers, setRegionMovers] = useState(null);
   const [regionLoading, setRegionLoading] = useState(true);
+  const [pptModalOpen, setPptModalOpen] = useState(false);
+  const [pptSections, setPptSections] = useState({ execSummary: true, vendorWise: true, regionWise: true, monthlyTrend: true, quarterlyTrend: false });
+  const [pptGenerating, setPptGenerating] = useState(false);
 
   // Yearly is a genuinely different data shape (multi-year totals, not a
   // breakdown of the currently-selected year) — fetched lazily, only once
@@ -1484,6 +1490,27 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
     };
   }), [monthlyData, monthlyGpData]);
 
+  // Region data isn't otherwise fully loaded at this level (only top-5
+  // "regionMovers" is, for Key Drivers) — fetched fresh here only when the
+  // Region-wise slide is actually requested, same lazy-fetch spirit as the
+  // rest of this component.
+  const handleExportPpt = async () => {
+    setPptGenerating(true);
+    try {
+      const regionRows = pptSections.regionWise ? await getRegionPerformanceData(year, "region", scenario) : null;
+      await exportOverviewToPpt({
+        year, scenario, kpis, monthlyData, monthlyGpData, quarterlyData, quarterlyGpData,
+        vendors: enrichedVendors, regions: regionRows, sections: pptSections, fmtN, fmtPct, fmtSignedPct,
+      });
+      setPptModalOpen(false);
+    } catch (e) {
+      console.error("PPT export failed:", e);
+      showToast(`Couldn't generate the PPT: ${e.message}`);
+    } finally {
+      setPptGenerating(false);
+    }
+  };
+
   // Yearly compares distinct calendar years, not "remaining months of this
   // year" — a Forecast series doesn't mean the same thing there, so it's
   // intentionally omitted for this view (see the `viewMode !== "yearly"`
@@ -1557,7 +1584,17 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
           }}
           filename={`overview-${viewMode}`}
         />
+        <button onClick={() => setPptModalOpen(true)} style={{ ...styles.secondaryBtn, display: "flex", alignItems: "center", gap: 6 }} title="Build a board-ready PPT deck">
+          <Presentation size={14} /> Export to PPT
+        </button>
       </div>
+
+      {pptModalOpen && (
+        <PptExportModal
+          sections={pptSections} setSections={setPptSections}
+          onCancel={() => setPptModalOpen(false)} onGenerate={handleExportPpt} generating={pptGenerating}
+        />
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
         <CollapsiblePanel title={`${periodLabel} Revenue — Actual vs Budget vs Forecast`}>
@@ -5420,6 +5457,48 @@ function SaveModal({ versionName, setVersionName, onCancel, onSaveNew, onUpdate,
           <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
           <button onClick={onSaveNew} style={currentVersionName ? styles.secondaryBtn : styles.primaryBtn}>
             {currentVersionName ? "Save as New Version" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PptExportModal({ sections, setSections, onCancel, onGenerate, generating }) {
+  const OPTIONS = [
+    ["execSummary", "Executive Summary", "KPI cards — YTD Actual vs Plan, FY Forecast vs Budget"],
+    ["monthlyTrend", "Monthly Trend", "Revenue & GP line charts, Budget vs Actual vs Forecast"],
+    ["quarterlyTrend", "Quarterly Trend", "Same, rolled up by quarter"],
+    ["vendorWise", "Vendor-wise Performance", "Top 15 vendors by FY Budget, with status"],
+    ["regionWise", "Region-wise Performance", "Top 15 regions by FY Budget, with status"],
+  ];
+  const toggle = (key) => setSections(prev => ({ ...prev, [key]: !prev[key] }));
+  const anySelected = Object.values(sections).some(Boolean);
+  return (
+    <div style={styles.modalOverlay} onClick={onCancel}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>Export to PPT</div>
+          <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>
+          Pick the slides to include — a title slide is always added.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+          {OPTIONS.map(([key, label, desc]) => (
+            <label key={key} style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer" }}>
+              <input type="checkbox" checked={sections[key]} onChange={() => toggle(key)} style={{ marginTop: 3 }} />
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
+                <div style={{ fontSize: 11.5, color: "#8A8A8A" }}>{desc}</div>
+              </div>
+            </label>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
+          <button onClick={onGenerate} disabled={!anySelected || generating} style={styles.primaryBtn}>
+            {generating ? "Generating…" : "Generate PPT"}
           </button>
         </div>
       </div>
