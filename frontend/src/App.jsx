@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
 import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb, MoreVertical, Download } from "lucide-react";
 import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
-import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
+import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, updateVersion as updateVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
 import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
 import { getEmployees, addEmployee, updateEmployee, resignEmployee, reinstateEmployee, deleteEmployee, setEmployeeHikes, getBenefitThresholds, setBenefitThresholds, computeEmployeeMonthlyCost, computeBenefitEligibility, computeEmployeeDashboardStats } from "./employeeData.js";
@@ -426,6 +426,11 @@ export default function App() {
   const [versions, setVersions] = useState([]);
   const [saveModalOpen, setSaveModalOpen] = useState(false);
   const [versionName, setVersionName] = useState("");
+  // Which saved version (if any) the working draft was last loaded from —
+  // session-only (not persisted to Firestore), so it resets on a page
+  // reload. Lets SaveModal offer "Update this version" (overwrite it in
+  // place) alongside the existing "always create a new snapshot" flow.
+  const [currentVersionId, setCurrentVersionId] = useState(null);
   const [loadingInit, setLoadingInit] = useState(true);
   const [toast, setToast] = useState(null);
   const [planningVendor, setPlanningVendor] = useState(null);
@@ -855,14 +860,36 @@ export default function App() {
   };
 
   /* ============================= VERSIONING ============================= */
-  const saveVersion = async () => {
+  // Always creates a brand-new snapshot (the pre-existing behavior) — now
+  // named saveAsNewVersion since SaveModal offers a second, distinct path
+  // (handleUpdateVersion) when a version is currently loaded. After
+  // creating, that new version becomes "currently loaded" — the natural
+  // continuation, since you're now effectively working on it.
+  const saveAsNewVersion = async () => {
     const name = versionName.trim() || `Version ${versions.length + 1}`;
     try {
       const created = await saveVersionFn(name, auth.currentUser?.email);
       setVersions([created, ...versions]);
+      setCurrentVersionId(created.id);
       showToast(`Saved "${name}"`);
     } catch (e) {
       showToast(`Couldn't save version: ${e.message}`);
+    }
+    setSaveModalOpen(false); setVersionName("");
+  };
+  // Overwrites the currently-loaded version in place with whatever's in
+  // the working draft now — the option this feature adds. Only ever
+  // callable when currentVersionId is set (SaveModal only shows this
+  // button then), so no separate null-guard toast needed here.
+  const handleUpdateVersion = async () => {
+    const current = versions.find(v => v.id === currentVersionId);
+    try {
+      await updateVersionFn(currentVersionId, auth.currentUser?.email);
+      const rows = await listSavedVersions();
+      setVersions(rows);
+      showToast(`Updated "${current?.name || "version"}"`);
+    } catch (e) {
+      showToast(`Couldn't update version: ${e.message}`);
     }
     setSaveModalOpen(false); setVersionName("");
   };
@@ -870,6 +897,7 @@ export default function App() {
     try {
       await loadVersionFn(id);
       await loadVendorsForYear(year);
+      setCurrentVersionId(id);
       showToast("Version loaded");
       setTab("overview");
     } catch (e) {
@@ -1014,7 +1042,7 @@ export default function App() {
           {effectiveTab === "employees" && <EmployeesTab showToast={showToast} year={year} />}
           {effectiveTab === "assumptions" && <AssumptionsTab showToast={showToast} skoUplift={skoUplift} />}
           {effectiveTab === "operationalStats" && <OperationalStatsTab showToast={showToast} year={year} />}
-          {effectiveTab === "versions" && <VersionsTab versions={versions} onLoad={loadVersion} onSaveClick={() => setSaveModalOpen(true)} activeBudgetingYear={activeBudgetingYear} showToast={showToast} onRefreshCurrentYear={() => loadVendorsForYear(year)} />}
+          {effectiveTab === "versions" && <VersionsTab versions={versions} onLoad={loadVersion} onSaveClick={() => setSaveModalOpen(true)} activeBudgetingYear={activeBudgetingYear} showToast={showToast} onRefreshCurrentYear={() => loadVendorsForYear(year)} currentVersionId={currentVersionId} />}
         </main>
           </>
         )}
@@ -1044,7 +1072,13 @@ export default function App() {
         <button onClick={() => setChatOpen(true)} style={styles.chatFab} aria-label="Open budget assistant"><Terminal size={20} /></button>
       )}
 
-      {saveModalOpen && <SaveModal versionName={versionName} setVersionName={setVersionName} onCancel={() => setSaveModalOpen(false)} onSave={saveVersion} />}
+      {saveModalOpen && (
+        <SaveModal
+          versionName={versionName} setVersionName={setVersionName} onCancel={() => setSaveModalOpen(false)}
+          onSaveNew={saveAsNewVersion} onUpdate={handleUpdateVersion}
+          currentVersionName={versions.find(v => v.id === currentVersionId)?.name || null}
+        />
+      )}
 
       {addVendorModalOpen && <AddVendorModal onCancel={() => setAddVendorModalOpen(false)} onAdd={handleAddVendor} year={year} />}
 
@@ -5035,7 +5069,7 @@ function CashFlowTab({ showToast, year }) {
   );
 }
 
-function VersionsTab({ versions, onLoad, onSaveClick, activeBudgetingYear, showToast, onRefreshCurrentYear }) {
+function VersionsTab({ versions, onLoad, onSaveClick, activeBudgetingYear, showToast, onRefreshCurrentYear, currentVersionId }) {
   const [baseYear, setBaseYear] = useState((activeBudgetingYear || new Date().getFullYear() + 1) - 1);
   const [growthPct, setGrowthPct] = useState(17);
   const [targetYears, setTargetYears] = useState(() => {
@@ -5120,7 +5154,18 @@ function VersionsTab({ versions, onLoad, onSaveClick, activeBudgetingYear, showT
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {versions.map(v => (
               <div key={v.id} style={styles.versionRow}>
-                <div><div style={{ fontWeight: 600, fontSize: 14 }}>{v.name}</div><div style={{ fontSize: 11.5, color: "#6B6B6B", display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}><Clock size={11} /> {new Date(v.created_at).toLocaleString()}</div></div>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{v.name}</div>
+                    {v.id === currentVersionId && (
+                      <span style={{ fontSize: 9.5, fontWeight: 600, padding: "2px 7px", borderRadius: 20, color: STATUS_COLORS.ahead, background: "#E3ECFB" }}>Currently Loaded</span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "#6B6B6B", display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
+                    <Clock size={11} /> {new Date(v.created_at).toLocaleString()}
+                    {v.updated_at && ` · Updated ${new Date(v.updated_at).toLocaleString()}`}
+                  </div>
+                </div>
                 <button onClick={() => onLoad(v.id)} style={styles.secondaryBtn}>Load</button>
               </div>
             ))}
@@ -5342,7 +5387,11 @@ function DiffCard({ diff, onConfirm, onCancel }) {
   );
 }
 
-function SaveModal({ versionName, setVersionName, onCancel, onSave }) {
+// Two distinct paths when a version is currently loaded (currentVersionName
+// set): "Update" overwrites that version in place; the name field below it
+// always creates a separate new snapshot. With nothing currently loaded,
+// this collapses back to the original single save flow.
+function SaveModal({ versionName, setVersionName, onCancel, onSaveNew, onUpdate, currentVersionName }) {
   return (
     <div style={styles.modalOverlay} onClick={onCancel}>
       <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
@@ -5351,10 +5400,27 @@ function SaveModal({ versionName, setVersionName, onCancel, onSave }) {
           <button onClick={onCancel} style={styles.iconBtnGhost} title="Close"><X size={16} /></button>
         </div>
         <div style={{ fontSize: 12.5, color: "#6B6B6B", marginBottom: 14 }}>Visible to everyone using this tool.</div>
-        <input autoFocus value={versionName} onChange={(e) => setVersionName(e.target.value)} placeholder="e.g. Q3 Board Review" style={styles.modalInput} onKeyDown={(e) => { if (e.key === "Enter") onSave(); }} />
+
+        {currentVersionName && (
+          <>
+            <button onClick={onUpdate} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center" }}>
+              Update "{currentVersionName}"
+            </button>
+            <div style={{ fontSize: 11, color: "#8A8A8A", marginTop: 6, marginBottom: 16 }}>
+              Overwrites this version's saved data with your current changes.
+            </div>
+            <div style={{ fontSize: 11.5, color: "#8A8A8A", borderTop: "1px solid #E0E0E0", paddingTop: 14, marginBottom: 10 }}>
+              Or save as a separate version instead:
+            </div>
+          </>
+        )}
+
+        <input autoFocus value={versionName} onChange={(e) => setVersionName(e.target.value)} placeholder="e.g. Q3 Board Review" style={styles.modalInput} onKeyDown={(e) => { if (e.key === "Enter") onSaveNew(); }} />
         <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
           <button onClick={onCancel} style={styles.secondaryBtn}>Cancel</button>
-          <button onClick={onSave} style={styles.primaryBtn}>Save</button>
+          <button onClick={onSaveNew} style={currentVersionName ? styles.secondaryBtn : styles.primaryBtn}>
+            {currentVersionName ? "Save as New Version" : "Save"}
+          </button>
         </div>
       </div>
     </div>

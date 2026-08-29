@@ -416,7 +416,7 @@ function scaleGrid(grid, ratio) {
 export async function listSavedVersions() {
   const q = query(collection(db, "budgetVersions"), where("isWorking", "==", false), orderBy("createdAt", "desc"));
   const snap = await getDocs(q);
-  return snap.docs.map(d => ({ id: d.id, ...d.data(), created_at: d.data().createdAt?.toDate?.().toISOString() }));
+  return snap.docs.map(d => ({ id: d.id, ...d.data(), created_at: d.data().createdAt?.toDate?.().toISOString(), updated_at: d.data().updatedAt?.toDate?.().toISOString() || null }));
 }
 
 export async function saveVersion(name, createdBy) {
@@ -442,6 +442,30 @@ export async function loadVersion(versionId) {
   const copyBatch = writeBatch(db);
   source.forEach(d => copyBatch.set(doc(db, "budgetVersions", workingId, "vendorBudgets", d.id), d.data()));
   await copyBatch.commit();
+}
+
+// Overwrites an EXISTING saved version with whatever's currently in the
+// working draft — the counterpart to saveVersion's "always create a new
+// snapshot" behavior. Same delete-then-copy technique loadVersion uses
+// (in the opposite direction), so a vendor removed since the version was
+// first saved doesn't linger in it. The caller is responsible for knowing
+// which version is "currently loaded" (App.jsx tracks this client-side,
+// set whenever loadVersion() is called) — this function just overwrites
+// whatever versionId it's given.
+export async function updateVersion(versionId, updatedBy) {
+  const workingId = await getWorkingVersionId();
+
+  const existing = await getDocs(collection(db, "budgetVersions", versionId, "vendorBudgets"));
+  const deleteBatch = writeBatch(db);
+  existing.forEach(d => deleteBatch.delete(d.ref));
+  await deleteBatch.commit();
+
+  const workingBudgets = await getDocs(collection(db, "budgetVersions", workingId, "vendorBudgets"));
+  const copyBatch = writeBatch(db);
+  workingBudgets.forEach(d => copyBatch.set(doc(db, "budgetVersions", versionId, "vendorBudgets", d.id), d.data()));
+  await copyBatch.commit();
+
+  await setDoc(doc(db, "budgetVersions", versionId), { updatedBy, updatedAt: Timestamp.now() }, { merge: true });
 }
 
 // ---- Multi-year budget projection (growth-based bulk generation) ----------
