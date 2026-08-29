@@ -316,13 +316,19 @@ export default function App() {
   // check happening. Nothing tab-related renders until this is true.
   const [allowedTabs, setAllowedTabs] = useState(null);
   const [accessProfileReady, setAccessProfileReady] = useState(false);
+  // Display name for TopBar — approvedUsers/{email}.name (set by whoever
+  // approved the login), falling back to the Microsoft SSO displayName,
+  // then the email's local-part, so there's always something short to
+  // show instead of the full email address.
+  const [myName, setMyName] = useState(null);
   useEffect(() => {
     let cancelled = false;
     getMyAccessProfile()
-      .then(({ allowedTabs }) => { if (!cancelled) setAllowedTabs(allowedTabs); })
+      .then(({ allowedTabs, name }) => { if (!cancelled) { setAllowedTabs(allowedTabs); setMyName(name); } })
       .finally(() => { if (!cancelled) setAccessProfileReady(true); });
     return () => { cancelled = true; };
   }, []);
+  const displayName = myName || auth.currentUser?.displayName || auth.currentUser?.email?.split("@")[0] || "";
   // Belt-and-suspenders: also derived at render time (effectiveTab below) so
   // there's no single-frame mismatch between the Sidebar's filtered items
   // and which tab's content actually renders; this effect commits that
@@ -633,15 +639,6 @@ export default function App() {
     const counts = { on_track: 0, watch: 0, needs_attention: 0, margin_risk: 0 };
     scenarioVendors.forEach(v => { const s = computeVendorStatus(v); counts[s] = (counts[s] || 0) + 1; });
     return counts;
-  }, [scenarioVendors]);
-
-  // Top-3-vendors-by-budget-revenue as a % of total budget revenue — a
-  // simple concentration-risk signal for Overview's Risks & Opportunities.
-  const top3ConcentrationPct = useMemo(() => {
-    const totalBudget = scenarioVendors.reduce((s, v) => s + v.budget_revenue, 0);
-    if (!totalBudget) return 0;
-    const top3 = [...scenarioVendors].sort((a, b) => b.budget_revenue - a.budget_revenue).slice(0, 3);
-    return top3.reduce((s, v) => s + v.budget_revenue, 0) / totalBudget;
   }, [scenarioVendors]);
 
   const tableVendors = useMemo(() => {
@@ -966,7 +963,7 @@ export default function App() {
         <TopBar
           scenario={scenario} setScenario={setScenario} skoUplift={skoUplift} onSave={() => setSaveModalOpen(true)} onSync={syncNow} syncing={syncing}
           year={year} activeBudgetingYear={activeBudgetingYear} lastSyncedAt={lastSyncedAt || persistedLastSyncedAt}
-          availableYears={availableYears} onYearChange={handleYearChange} isEditableYear={isEditableYear}
+          availableYears={availableYears} onYearChange={handleYearChange} isEditableYear={isEditableYear} displayName={displayName}
         />
       </div>
 
@@ -991,7 +988,7 @@ export default function App() {
             <OverviewTab
               kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
               year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab}
-              vendorStatusCounts={vendorStatusCounts} top3ConcentrationPct={top3ConcentrationPct}
+              vendorStatusCounts={vendorStatusCounts}
             />
           )}
           {effectiveTab === "vendors" && (
@@ -1079,7 +1076,7 @@ function scaleGrid(grid, ratio) {
 
 /* ============================= TOP-LEVEL SUBCOMPONENTS ============================= */
 
-function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, year, activeBudgetingYear, lastSyncedAt, availableYears, onYearChange, isEditableYear }) {
+function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, year, activeBudgetingYear, lastSyncedAt, availableYears, onYearChange, isEditableYear, displayName }) {
   const { unit, setUnit } = useNumberUnit();
   const today = new Date();
   const todayLabel = today.toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
@@ -1114,29 +1111,35 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
             <button key={val} onClick={() => setUnit(val)} style={{ ...styles.unitToggleBtn, ...(unit === val ? styles.unitToggleBtnActive : {}) }} title={`Show all figures in ${val}`}>{label}</button>
           ))}
         </div>
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
-          <div style={styles.scenarioToggle}>
-            <button onClick={() => setScenario("Macnica")} style={{ ...styles.scenarioBtn, ...(scenario === "Macnica" ? styles.scenarioBtnActive : {}) }}>Macnica</button>
-            <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
-          </div>
-          <div style={{ fontSize: 9.5, color: "#8A8A8A", whiteSpace: "nowrap" }}>
-            {/* Prefers this session's own sync click; falls back to the
-                persisted lastSyncedAt read back from Firestore (written by
-                syncCipr) — so this survives a page reload instead of
-                resetting to "not synced" every time. */}
-            {lastSyncedAt ? `Last synced ${lastSyncedAt.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : "Not synced yet"}
-          </div>
+        <div style={styles.scenarioToggle}>
+          <button onClick={() => setScenario("Macnica")} style={{ ...styles.scenarioBtn, ...(scenario === "Macnica" ? styles.scenarioBtnActive : {}) }}>Macnica</button>
+          <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
         </div>
-        <button onClick={onSync} disabled={syncing} style={styles.iconBtnGhost} title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}>
-          <RefreshCw size={15} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
-        </button>
         <button onClick={onSave} style={styles.primaryBtn}><Save size={15} style={{ marginRight: 6 }} /> Save Version</button>
         {auth.currentUser && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
-            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{auth.currentUser.email}</span>
+            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
             <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
           </div>
         )}
+        {/* Sync cluster — rightmost element in the bar. Button on top,
+            persisted "Last synced" timestamp underneath (prefers this
+            session's own sync click; falls back to lastSyncedAt read back
+            from Firestore, written by syncCipr, so it survives a reload
+            instead of resetting to "not synced" every time). */}
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
+          <button
+            onClick={onSync} disabled={syncing}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1.5px solid #2E5FA3", color: "#2E5FA3", borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, cursor: syncing ? "default" : "pointer" }}
+            title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}
+          >
+            <RefreshCw size={14} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
+            Sync Now
+          </button>
+          <div style={{ fontSize: 10, color: "#8A8A8A", whiteSpace: "nowrap" }}>
+            {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+          </div>
+        </div>
       </div>
     </header>
   );
@@ -1357,7 +1360,7 @@ function actualEndpointDot(cutoffIdx, viewMode) {
   };
 }
 
-function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, vendorStatusCounts, top3ConcentrationPct }) {
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, vendorStatusCounts }) {
   const { fmtN, unit } = useNumberUnit();
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
   const [yearlyRaw, setYearlyRaw] = useState(null);
@@ -1466,27 +1469,7 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
   const gpChartData = viewMode === "monthly" ? monthlyGpData : viewMode === "quarterly" ? quarterlyGpData : yearlyGpData;
   const periodLabel = { monthly: "Monthly", quarterly: "Quarterly", yearly: "By Year (last 5 years)" }[viewMode];
   const cutoffIdx = getActualCutoffMonthIndex(year);
-
-  // One anomaly note: a single closed month whose Actual fell materially
-  // below that month's Budget while its immediate neighbors didn't —
-  // phrased as an observation to check, never a claimed cause (the app
-  // doesn't have the data to know *why* a month dipped).
-  const anomalyNote = useMemo(() => {
-    const varOf = (row) => (row?.Actual == null || !row?.Budget) ? null : (row.Actual - row.Budget) / row.Budget;
-    for (let i = 1; i < cutoffIdx; i++) {
-      const curVar = varOf(monthlyData[i]);
-      if (curVar === null || curVar > -0.3) continue;
-      const prevVar = varOf(monthlyData[i - 1]);
-      const nextVar = varOf(monthlyData[i + 1]);
-      if ((prevVar === null || prevVar > -0.15) && (nextVar === null || nextVar > -0.15)) {
-        return `Revenue dipped in ${monthlyData[i].month} ${year} relative to budget, while neighboring months didn't — worth checking for timing/seasonality before treating it as a trend.`;
-      }
-    }
-    return null;
-  }, [monthlyData, cutoffIdx, year]);
-
   const needsAttentionTotal = (vendorStatusCounts?.needs_attention || 0) + (vendorStatusCounts?.margin_risk || 0);
-  const gpImpactEstimate = kpis.actualGpPct < kpis.blendedGpPct ? (kpis.blendedGpPct - kpis.actualGpPct) * kpis.totalActualYtd : 0;
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
@@ -1546,30 +1529,44 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
           )}
         </CollapsiblePanel>
 
-        <CollapsiblePanel title={`${periodLabel} Gross Profit — Actual vs Budget vs Forecast`}>
+        <CollapsiblePanel title={`${periodLabel} Gross Profit — Actual vs Budget (with GP%)`}>
           {(height) => (
             <>
-              {/* Single $ axis only — GP% shown as a text callout instead of
-                  a second axis, per the redesign spec (a % axis on a $
-                  chart invites misreading the two series against each
-                  other). */}
-              <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
-                YTD GP% {fmtPct(kpis.actualGpPct)} vs budget {fmtPct(kpis.blendedGpPct)} · FY forecast GP% {fmtPct(kpis.forecastGpPct)}
+              {/* Header stat callout — YTD GP% vs budget GP%, with the pts
+                  gap called out in red/green. Bar+line combo with GP% on
+                  its own right-hand axis, matching the reference layout. */}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 28, marginBottom: 8 }}>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 10.5, color: "#8A8A8A" }}>YTD GP%</div>
+                  <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>{fmtPct(kpis.actualGpPct)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 10.5, color: "#8A8A8A" }}>vs Budget GP%</div>
+                  <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>
+                    {fmtPct(kpis.blendedGpPct)}{" "}
+                    <span style={{ fontSize: 12, fontWeight: 600, color: kpis.actualGpPct >= kpis.blendedGpPct ? "#1B8A3A" : "#C00000" }}>
+                      {kpis.actualGpPct >= kpis.blendedGpPct ? "+" : ""}{((kpis.actualGpPct - kpis.blendedGpPct) * 100).toFixed(1)} pts
+                    </span>
+                  </div>
+                </div>
               </div>
               {(viewMode === "yearly" && yearlyLoading) ? (
                 <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6B6B", fontSize: 13 }}>Loading last 5 years…</div>
               ) : (
                 <ResponsiveContainer width="100%" height={height}>
-                  <LineChart data={gpChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                  <ComposedChart data={gpChartData} margin={{ top: 20, right: 20, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
                     <XAxis dataKey="month" stroke="#6B6B6B" fontSize={12} />
-                    <YAxis stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
-                    <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} cursor={{ stroke: "#1B8A3A", strokeDasharray: "3 3" }} />
+                    <YAxis yAxisId="left" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => fmtN(v)} width={yAxisWidthForUnit(unit)} />
+                    <YAxis yAxisId="right" orientation="right" stroke="#6B6B6B" fontSize={12} tickFormatter={(v) => `${v}%`} width={44} domain={[0, "dataMax"]} />
+                    <Tooltip formatter={(v, name) => name === "GP% (Actual)" ? `${v}%` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, color: "#111111" }} cursor={{ fill: "rgba(0,0,0,0.03)" }} />
                     <Legend verticalAlign="bottom" />
-                    <Line type="monotone" dataKey="Budget" stroke="#6B6B6B" strokeWidth={2} strokeDasharray="5 4" dot={false} />
-                    <Line type="monotone" dataKey="Actual" stroke="#1B8A3A" strokeWidth={2.5} dot={actualEndpointDot(cutoffIdx, viewMode)} connectNulls={false} />
-                    {viewMode !== "yearly" && <Line type="monotone" dataKey="Forecast" stroke="#2E5FA3" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={false} />}
-                  </LineChart>
+                    <Bar yAxisId="left" dataKey="Actual" name="Actual GP ($)" fill="#B4231E" radius={[3, 3, 0, 0]} maxBarSize={40} />
+                    <Line yAxisId="left" type="monotone" dataKey="Budget" name="Budget GP ($)" stroke="#9A9A9A" strokeWidth={1.5} strokeDasharray="5 4" dot={false} />
+                    <Line yAxisId="right" type="monotone" dataKey="Actual GP%" name="GP% (Actual)" stroke="#B4231E" strokeWidth={2} dot={{ r: 4, fill: "#B4231E", strokeWidth: 0 }} connectNulls={false}>
+                      <LabelList dataKey="Actual GP%" position="top" formatter={(v) => (v === null || v === undefined) ? "" : `${v}%`} style={{ fontSize: 10.5, fill: "#333333" }} />
+                    </Line>
+                  </ComposedChart>
                 </ResponsiveContainer>
               )}
             </>
@@ -1577,9 +1574,8 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
         </CollapsiblePanel>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginTop: 4, alignItems: "start" }}>
+      <div style={{ marginTop: 4 }}>
         <KeyDriversPanel movers={movers} marginDetractors={marginDetractors} regionMovers={regionMovers} regionLoading={regionLoading} fmtN={fmtN} onNavigate={onNavigate} />
-        <RisksOpportunitiesPanel kpis={kpis} gpImpactEstimate={gpImpactEstimate} top3ConcentrationPct={top3ConcentrationPct} anomalyNote={anomalyNote} fmtN={fmtN} onNavigate={onNavigate} />
       </div>
 
       <div style={{ ...styles.panel, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
@@ -1683,43 +1679,6 @@ function KeyDriversPanel({ movers, marginDetractors, regionMovers, regionLoading
           ))}
           <button onClick={() => onNavigate("regions")} style={{ ...styles.secondaryBtn, background: "transparent", border: "none", padding: "4px 0", fontSize: 11.5, color: "#B4231E" }}>View all →</button>
         </div>
-      </div>
-    </div>
-  );
-}
-
-// Right column — a single severity-colored list, scoped to revenue/GP
-// drivers only. No pipeline/renewal item: there's no real data source for
-// that anywhere in this app's Firestore schema, and inventing one would
-// violate the same "never invent" principle the chat assistant follows.
-function RisksOpportunitiesPanel({ kpis, gpImpactEstimate, top3ConcentrationPct, anomalyNote, fmtN, onNavigate }) {
-  const items = [];
-  if (kpis.actualGpPct < kpis.blendedGpPct - 0.003) {
-    items.push({ severity: "warning", text: `GP margin is trailing budget by ${Math.abs((kpis.actualGpPct - kpis.blendedGpPct) * 100).toFixed(1)} pts — an estimated ${fmtN(gpImpactEstimate)} of GP at the current run rate.` });
-  }
-  if (top3ConcentrationPct >= 0.4) {
-    items.push({ severity: "warning", text: `Top 3 vendors make up ${(top3ConcentrationPct * 100).toFixed(0)}% of budgeted revenue — a concentration risk if any one of them slips.` });
-  }
-  if (anomalyNote) items.push({ severity: "good", text: anomalyNote });
-  if (kpis.varAmt >= 0 && kpis.actualGpPct >= kpis.blendedGpPct) {
-    items.push({ severity: "good", text: "Revenue and margin are both ahead of plan — no immediate risk flagged from this data." });
-  }
-  const colorFor = { critical: "#C00000", warning: "#8A6D1A", good: "#1B8A3A" };
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelTitle}>Risks & Opportunities</div>
-      {items.length === 0 ? (
-        <div style={{ fontSize: 12, color: "#8A8A8A", marginBottom: 12 }}>Nothing flagged from the current data.</div>
-      ) : items.map((it, i) => (
-        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 12, fontSize: 12, lineHeight: 1.5 }}>
-          <span style={{ width: 7, height: 7, borderRadius: "50%", background: colorFor[it.severity], flexShrink: 0, marginTop: 4 }} />
-          <span style={{ color: "#333333" }}>{it.text}</span>
-        </div>
-      ))}
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 14, paddingTop: 12, borderTop: "1px solid #E0E0E0" }}>
-        <button onClick={() => onNavigate("assumptions")} style={{ background: "transparent", border: "none", padding: 0, fontSize: 12, color: "#B4231E", textAlign: "left", cursor: "pointer" }}>View Assumptions →</button>
-        <button onClick={() => onNavigate("vendors")} style={{ background: "transparent", border: "none", padding: 0, fontSize: 12, color: "#B4231E", textAlign: "left", cursor: "pointer" }}>View Vendors →</button>
       </div>
     </div>
   );
