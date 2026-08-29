@@ -88,17 +88,18 @@ function assertEditableYear(year, activeBudgetingYear) {
 // hardcoded to August (index 7) everywhere under the assumption the app
 // would only ever show the current year. Now computed per year: a closed
 // past year has a full 12 months of real actuals; the current year has
-// however many months have actually CLOSED (not the in-progress current
-// month — its actuals are necessarily partial, so treating it as "closed"
-// overstated freshness and drew chart lines through an incomplete month);
-// a future year (the active budgeting year, before it's underway) has none
-// yet. Returns a 0-indexed month (11 = December, -1 = no months yet) — used
-// as an inclusive cutoff.
+// however many months have elapsed so far (INCLUDING the current,
+// still-in-progress month, with whatever partial actuals have synced for
+// it — reverted 2026-08-29 per direct request, after briefly trying
+// "last closed month only" earlier the same day; that version is what
+// the `- 1` below undoes); a future year (the active budgeting year,
+// before it's underway) has none yet. Returns a 0-indexed month
+// (11 = December, -1 = no months yet) — used as an inclusive cutoff.
 export function getActualCutoffMonthIndex(year) {
   const currentCalendarYear = new Date().getFullYear();
   if (year < currentCalendarYear) return 11;
   if (year > currentCalendarYear) return -1;
-  return new Date().getMonth() - 1; // naturally -1 in January = no closed months yet
+  return new Date().getMonth();
 }
 
 export async function getVendors(year) {

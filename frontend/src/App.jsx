@@ -1117,28 +1117,60 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
   const shortDateLabel = today.toLocaleDateString("en-US", { day: "numeric", month: "short", year: "numeric" });
   const cutoffIdx = getActualCutoffMonthIndex(year);
   return (
-    <header style={{ ...styles.topBar, flexWrap: "wrap", rowGap: 6 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <div style={styles.logoMark}>CK</div>
-        <div>
-          <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
-          <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
-          <div style={styles.brandSub}>{todayLabel}</div>
-          {/* Explicit freshness line — so it's clear at a glance whether the
-              numbers on screen are current, without hunting for the sync
-              icon. cutoffIdx can be -1 (no closed months yet, e.g. a future
-              year not underway) — guarded to avoid an "Actuals through
-              undefined" label in that case. */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
-            <span>Data as of {shortDateLabel}</span>
-            <Info size={11} style={{ flexShrink: 0 }} title="Today's date — the app doesn't back-date figures; every number reflects data synced as of this moment." />
-            {cutoffIdx >= 0 && (<><span>|</span><span>Actuals through {MONTHS[cutoffIdx]} {year}</span></>)}
+    <header style={{ ...styles.topBar, flexDirection: "column", alignItems: "stretch", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", rowGap: 6 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+          <div style={styles.logoMark}>CK</div>
+          <div>
+            <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
+            <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
+            <div style={styles.brandSub}>{todayLabel}</div>
+            {/* Explicit freshness line — so it's clear at a glance whether the
+                numbers on screen are current, without hunting for the sync
+                icon. cutoffIdx can be -1 (no closed months yet, e.g. a future
+                year not underway) — guarded to avoid an "Actuals through
+                undefined" label in that case. */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
+              <span>Data as of {shortDateLabel}</span>
+              <Info size={11} style={{ flexShrink: 0 }} title="Today's date — the app doesn't back-date figures; every number reflects data synced as of this moment." />
+              {cutoffIdx >= 0 && (<><span>|</span><span>Actuals through {MONTHS[cutoffIdx]} {year}</span></>)}
+            </div>
           </div>
+        </div>
+
+        <YearSelector year={year} availableYears={availableYears} onYearChange={onYearChange} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Sync cluster. Button on top, persisted "Last synced" timestamp
+              underneath (prefers this session's own sync click; falls back
+              to lastSyncedAt read back from Firestore, written by syncCipr,
+              so it survives a reload instead of resetting to "not synced"
+              every time). */}
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+            <button
+              onClick={onSync} disabled={syncing}
+              style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1.5px solid #2E5FA3", color: "#2E5FA3", borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, cursor: syncing ? "default" : "pointer" }}
+              title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}
+            >
+              <RefreshCw size={14} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
+              Sync Now
+            </button>
+            <div style={{ fontSize: 10, color: "#8A8A8A", whiteSpace: "nowrap" }}>
+              {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+            </div>
+          </div>
+          {/* User name (no email) + sign-out — rightmost element. */}
+          {auth.currentUser && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
+              <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
+              <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
+            </div>
+          )}
         </div>
       </div>
 
-      <YearSelector year={year} availableYears={availableYears} onYearChange={onYearChange} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />
-
+      {/* Moved here (left-aligned, below the brand/freshness block) per
+          direct feedback — previously sat in the right-hand cluster above. */}
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <div style={styles.unitToggle} title="Number display unit — applies everywhere">
           {[["millions", "M"], ["thousands", "K"], ["full", "Full"]].map(([val, label]) => (
@@ -1150,31 +1182,6 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
           <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
         </div>
         <button onClick={onSave} style={styles.primaryBtn}><Save size={15} style={{ marginRight: 6 }} /> Save Version</button>
-        {/* Sync cluster. Button on top, persisted "Last synced" timestamp
-            underneath (prefers this session's own sync click; falls back
-            to lastSyncedAt read back from Firestore, written by syncCipr,
-            so it survives a reload instead of resetting to "not synced"
-            every time). */}
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
-          <button
-            onClick={onSync} disabled={syncing}
-            style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1.5px solid #2E5FA3", color: "#2E5FA3", borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, cursor: syncing ? "default" : "pointer" }}
-            title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}
-          >
-            <RefreshCw size={14} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
-            Sync Now
-          </button>
-          <div style={{ fontSize: 10, color: "#8A8A8A", whiteSpace: "nowrap" }}>
-            {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
-          </div>
-        </div>
-        {/* User name (no email) + sign-out — now the rightmost element. */}
-        {auth.currentUser && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
-            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
-            <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
-          </div>
-        )}
       </div>
     </header>
   );
@@ -3707,13 +3714,24 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
           against). Completed years have nothing left to track; budgeting/
           future years have no actuals yet to compute status from at all. */}
       {!completed && !isBudgetingOrFuture && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 14 }}>
-          <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
-          <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
-          <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
-          <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
-          <AttentionCard label={STATUS_LABELS.on_track} value={onTrackCount} color={STATUS_COLORS.on_track} icon={Check} onClick={() => setQuickFilter("on_track")} active={quickFilter === "on_track"} />
-        </div>
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 8 }}>
+            <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
+            <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
+            <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
+            <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+            <AttentionCard label={STATUS_LABELS.on_track} value={onTrackCount} color={STATUS_COLORS.on_track} icon={Check} onClick={() => setQuickFilter("on_track")} active={quickFilter === "on_track"} />
+          </div>
+          {/* Requested caveat — flagging in-code (and to the user) that as
+              currently implemented, computeVendorStatus returns exactly ONE
+              bucket per vendor (an if/else chain), so this text describes a
+              scenario the code doesn't actually allow today. Left in as
+              literally requested; worth revisiting if that's not what was
+              meant. */}
+          <div style={{ fontSize: 11, color: "#8A6D1A", marginBottom: 14 }}>
+            <b>★</b> Status flag may overlap - a vendor can appear in multiple categories.
+          </div>
+        </>
       )}
 
       {/* Filters */}
@@ -3754,10 +3772,6 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
           </button>
           <ExportMenu getSheets={getExportSheets} filename={`vendors-${year}`} />
         </div>
-      </div>
-
-      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
-        Showing {filtered.length} of {enriched.length} vendor{enriched.length === 1 ? "" : "s"}
       </div>
 
       <div style={styles.panel}>
@@ -3886,6 +3900,11 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
             <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 28, pointerEvents: "none", background: "linear-gradient(to right, rgba(255,255,255,0), rgba(255,255,255,0.95))" }} />
           )}
         </div>
+      </div>
+
+      {/* Moved below the table per direct feedback — was above it before. */}
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginTop: 8 }}>
+        Showing {filtered.length} of {enriched.length} vendor{enriched.length === 1 ? "" : "s"}
       </div>
 
       {drilldownVendor && (
