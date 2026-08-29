@@ -31,6 +31,11 @@ const DATA_QUALITY = {
 };
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+// Fixed pixel width for the Vendor column on the Vendors performance
+// table — needed so the Status column (frozen right after it) has a
+// known, stable `left` offset to stick at. Must match styles.thStickyCol2/
+// tdStickyCol2's `left` value.
+const VENDOR_COL_WIDTH = 190;
 const CURRENT_MONTH_IDX = 7; // August 2026 -> Jan..Aug actual = indices 0-7 (months 1-8)
 
 /* ============================= FORMATTERS ============================= */
@@ -994,7 +999,7 @@ export default function App() {
                 onAddVendorClick={() => setAddVendorModalOpen(true)} onRemoveVendor={handleRemoveVendor}
               />
             ) : (
-              <VendorPerformanceView vendors={scenarioVendors} year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} />
+              <VendorPerformanceView vendors={scenarioVendors} year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} lastSyncedAt={lastSyncedAt || persistedLastSyncedAt} />
             )
           )}
           {effectiveTab === "regions" && (
@@ -3265,12 +3270,17 @@ function EmployeeFormModal({ initial, vendorOptions, regionOptions, onCancel, on
 // Only rendered for non-editable years — the active budgeting year keeps
 // the original simple VendorsTab completely untouched, per the explicit
 // requirement to keep budget entry uncluttered.
+// Six pills — All + the 5 real computeVendorStatus buckets — matching the
+// tiles and row badges 1:1 (previously only 5 entries: Watch had no pill,
+// and "Ahead" was a synthetic ytdVarPct>0.15 filter with no real status
+// bucket behind it; both fixed now that computeVendorStatus has 5 buckets).
 const QUICK_FILTERS = [
   ["all", "All"],
   ["needs_attention", "Needs Attention"],
   ["margin_risk", "Margin Risk"],
-  ["on_track", "On Track"],
+  ["watch", "Watch"],
   ["ahead", "Ahead"],
+  ["on_track", "On Track"],
 ];
 const SORT_OPTIONS = [
   ["budget_revenue", "Budget Revenue"],
@@ -3282,7 +3292,7 @@ const SORT_OPTIONS = [
   ["forecastAchievementPct", "Forecast Achievement %"],
 ];
 
-function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }) {
+function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, lastSyncedAt }) {
   const { fmtN } = useNumberUnit();
   const completed = isYearCompleted(year);
   const yearClass = classifyYear(year, activeBudgetingYear);
@@ -3297,6 +3307,7 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
 
   const [buHeadFilter, setBuHeadFilter] = useState("");
   const [regionFilter, setRegionFilter] = useState("");
+  const [tierFilter, setTierFilter] = useState("");
   const [vendorSearch, setVendorSearch] = useState("");
   const [quickFilter, setQuickFilter] = useState("all");
   const [metricView, setMetricView] = useState("revenue"); // "revenue" | "gp"
@@ -3305,6 +3316,18 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
   const [drilldownVendor, setDrilldownVendor] = useState(null);
   const [managementForecasts, setManagementForecasts] = useState({});
   const [formulasOpen, setFormulasOpen] = useState(false);
+  // Right-edge scroll-fade affordance for the frozen-column table — visible
+  // only while there's more content to the right to scroll to (hidden once
+  // scrolled all the way, unlike a plain static decoration). Handler
+  // defined here (needs no deps itself); the effect that calls it on data
+  // changes is set up below, after `filtered` exists.
+  const tableScrollRef = useRef(null);
+  const [showScrollFade, setShowScrollFade] = useState(false);
+  const checkScrollFade = () => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    setShowScrollFade(el.scrollWidth > el.clientWidth + 2 && el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -3345,26 +3368,34 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
 
   const buHeadOptions = useMemo(() => [...new Set(enriched.map(v => v.bu_head).filter(Boolean))].sort(), [enriched]);
   const regionOptions = useMemo(() => [...new Set(enriched.flatMap(v => v.regions || []))].sort(), [enriched]);
+  // Vendor Category/Tier — already populated per-row from CIPR (see
+  // firestoreData.js getVendors), just not previously exposed as a filter.
+  const tierOptions = useMemo(() => [...new Set(enriched.map(v => v.tier).filter(Boolean))].sort(), [enriched]);
 
-  const belowPlanCount = enriched.filter(v => v.ytdVarAmt < 0).length;
-  const atRiskCount = enriched.filter(v => v.status === "margin_risk").length;
-  const gpBelowBudgetCount = enriched.filter(v => v.actualGpPct < v.budgetGpPct - 0.01).length;
-  const aheadCount = enriched.filter(v => v.ytdVarPct > 0.15).length;
+  // Real status counts — tiles now count the SAME computeVendorStatus
+  // buckets the row badges and filter pills use, instead of each having
+  // its own independent, inconsistent threshold (was: ytdVarAmt<0,
+  // status==="margin_risk", actualGpPct<budgetGpPct-0.01 [1pt, not the
+  // real 3pt margin-risk threshold], and ytdVarPct>0.15 respectively).
+  const needsAttentionCount = enriched.filter(v => v.status === "needs_attention").length;
+  const marginRiskCount = enriched.filter(v => v.status === "margin_risk").length;
+  const watchCount = enriched.filter(v => v.status === "watch").length;
+  const aheadCount = enriched.filter(v => v.status === "ahead").length;
 
   const filtered = useMemo(() => {
     let rows = enriched;
     if (buHeadFilter) rows = rows.filter(v => v.bu_head === buHeadFilter);
     if (regionFilter) rows = rows.filter(v => (v.regions || []).includes(regionFilter));
+    if (tierFilter) rows = rows.filter(v => v.tier === tierFilter);
     if (vendorSearch) rows = rows.filter(v => v.vendor.toLowerCase().includes(vendorSearch.toLowerCase()));
-    if (quickFilter === "needs_attention") rows = rows.filter(v => v.status === "needs_attention");
-    else if (quickFilter === "margin_risk") rows = rows.filter(v => v.status === "margin_risk");
-    else if (quickFilter === "on_track") rows = rows.filter(v => v.status === "on_track");
-    else if (quickFilter === "ahead") rows = rows.filter(v => v.ytdVarPct > 0.15);
+    if (quickFilter !== "all") rows = rows.filter(v => v.status === quickFilter);
     return [...rows].sort((a, b) => {
       const dir = sortDir === "asc" ? 1 : -1;
       return ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir;
     });
-  }, [enriched, buHeadFilter, regionFilter, vendorSearch, quickFilter, sortKey, sortDir]);
+  }, [enriched, buHeadFilter, regionFilter, tierFilter, vendorSearch, quickFilter, sortKey, sortDir]);
+
+  useEffect(() => { checkScrollFade(); }, [filtered, metricView, completed, isBudgetingOrFuture]);
 
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -3418,10 +3449,16 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
-          {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
-            : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
-            : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+        <div>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
+            {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
+              : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
+              : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+          </div>
+          {/* Matches TopBar's exact "Last synced" string/format — Vendors-tab-local per spec, not threaded into Regions. */}
+          <div style={{ fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
+            {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+          </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button onClick={() => setFormulasOpen(true)} style={{ ...styles.secondaryBtn, fontSize: 12 }} title="How these numbers are calculated">
@@ -3443,10 +3480,10 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
           future years have no actuals yet to compute status from at all. */}
       {!completed && !isBudgetingOrFuture && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
-          <AttentionCard label="Below Plan" value={belowPlanCount} color="#C00000" onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
-          <AttentionCard label="At Risk" value={atRiskCount} color="#7A3F9A" onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
-          <AttentionCard label="GP% Below Budget" value={gpBelowBudgetCount} color="#8A6D1A" onClick={() => setMetricView("gp")} active={metricView === "gp"} />
-          <AttentionCard label="Significantly Ahead" value={aheadCount} color="#1B8A3A" onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+          <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
+          <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
+          <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
+          <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
         </div>
       )}
 
@@ -3460,6 +3497,13 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
         <select value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)} style={styles.yearSelect}>
           <option value="">All Regions</option>
           {regionOptions.map(r => <option key={r} value={r}>{r}</option>)}
+        </select>
+        {/* Vendor Category/Tier filter — resolves the redesign spec's §2.5
+            open question; data was already populated per-row, just never
+            surfaced as a filter until now. */}
+        <select value={tierFilter} onChange={(e) => setTierFilter(e.target.value)} style={styles.yearSelect}>
+          <option value="">All Tiers</option>
+          {tierOptions.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
         {!completed && !isBudgetingOrFuture && (
           <div style={styles.plViewToggle}>
@@ -3478,8 +3522,13 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
         </button>
       </div>
 
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
+        Showing {filtered.length} of {enriched.length} vendor{enriched.length === 1 ? "" : "s"}
+      </div>
+
       <div style={styles.panel}>
-        <div style={styles.tableScroll}>
+        <div style={{ position: "relative" }}>
+          <div style={styles.tableScroll} ref={tableScrollRef} onScroll={checkScrollFade}>
           <table style={styles.table}>
             {isBudgetingOrFuture ? (
               <>
@@ -3508,8 +3557,9 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
               <>
                 <thead>
                   <tr>
-                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>Vendor</th>
-                    {!completed && <th style={{ ...styles.th, textAlign: "left" }}>Status</th>}
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left", width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH }}>Vendor</th>
+                    {/* Frozen second column, right after Vendor — see VENDOR_COL_WIDTH/thStickyCol2. */}
+                    {!completed && <th style={{ ...styles.th, ...styles.thStickyCol2, textAlign: "left" }}>Status</th>}
                     <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
                     {!completed && <SortableTh label="YTD Budget" sortKeyName={ytdBudgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
                     <SortableTh label={completed ? "FY Actual" : "YTD Actual"} sortKeyName={actualKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
@@ -3523,39 +3573,67 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(v => (
+                  {filtered.map(v => {
+                    const balanceToDo = v[budgetKey] - v[actualKey];
+                    const exceededBudget = balanceToDo < 0;
+                    const gpPtsBehind = (v.budgetGpPct - v.actualGpPct) * 100;
+                    const flagged = v.status === "needs_attention" || v.status === "margin_risk" || v.status === "watch";
+                    return (
                     <tr key={v.vendor} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownVendor(v)}>
-                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{v.vendor}</td>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={v.vendor}>{v.vendor}</td>
                       {!completed && (
-                        <td style={{ ...styles.td, textAlign: "left" }}>
-                          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 5, color: "#FFFFFF", background: STATUS_COLORS[v.status] }}>{STATUS_LABELS[v.status]}</span>
+                        <td style={{ ...styles.td, ...styles.tdStickyCol2, textAlign: "left" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                            <StatusBadge status={v.status} />
+                            {/* Margin Risk rows show why, inline — instead of
+                                requiring a flip to the GP metric view to find
+                                the justifying number. */}
+                            {v.status === "margin_risk" && (
+                              <span style={{ fontSize: 9.5, fontWeight: 600, padding: "1px 6px", borderRadius: 4, color: KPI_TIER_COLORS.bad.fg, background: KPI_TIER_COLORS.bad.bg }}>
+                                GP -{gpPtsBehind.toFixed(1)} pts
+                              </span>
+                            )}
+                          </div>
                         </td>
                       )}
                       <td className="num" style={styles.td}>{fmtN(v[budgetKey])}</td>
                       {!completed && <td className="num" style={styles.td}>{fmtN(v[ytdBudgetKey])}</td>}
                       <td className="num" style={styles.td}>{fmtN(v[actualKey])}</td>
-                      <td className="num" style={styles.td}>{fmtN(v[budgetKey] - v[actualKey])}</td>
+                      <td className="num" style={{ ...styles.td, color: exceededBudget ? STATUS_COLORS.ahead : "inherit" }}>
+                        {/* Exceeded budget (Balance to Do < 0) is a notable
+                            positive outlier — a vendor has already delivered
+                            more than its full FY target with months still
+                            left — same blue "outlier" color as the Ahead
+                            status, not alarming red. */}
+                        {exceededBudget ? (
+                          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+                            <span>{fmtN(balanceToDo)}</span>
+                            <span style={{ fontSize: 9.5, fontWeight: 600, padding: "1px 6px", borderRadius: 4, color: "#FFFFFF", background: STATUS_COLORS.ahead }}>Exceeded FY budget</span>
+                          </div>
+                        ) : fmtN(balanceToDo)}
+                      </td>
                       <td className="num" style={{ ...styles.td, color: v[completed ? fyVarKey : varKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{v[completed ? fyVarKey : varKey] >= 0 ? "+" : ""}{fmtN(v[completed ? fyVarKey : varKey])}</td>
                       <td className="num" style={{ ...styles.td, color: v[completed ? fyVarPctKey : varPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(v[completed ? fyVarPctKey : varPctKey])}</td>
                       {!completed && <td className="num" style={styles.td}>{fmtN(v[fyForecastKey])}</td>}
                       {!completed && (
                         <td className="num" style={styles.td} onClick={(e) => e.stopPropagation()}>
-                          <ManagementForecastCell vendor={v.vendor} value={v.mgmtForecast} onSave={handleSetForecast} fmtN={fmtN} />
+                          <ManagementForecastCell vendor={v.vendor} value={v.mgmtForecast} onSave={handleSetForecast} fmtN={fmtN} flagged={flagged} />
                         </td>
                       )}
                       {!completed && <td className="num" style={{ ...styles.td, color: v[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{v[forecastVarKey] >= 0 ? "+" : ""}{fmtN(v[forecastVarKey])}</td>}
                       {!completed && <td className="num" style={{ ...styles.td, color: v[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(v[forecastVarPctKey])}</td>}
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: "2px solid #111111" }}>
-                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
-                    {!completed && <td style={styles.td}></td>}
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH }}>Total</td>
+                    {!completed && <td style={{ ...styles.td, ...styles.tdStickyCol2 }}></td>}
                     <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
                     {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.ytdBudget)}</td>}
                     <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.actual)}</td>
-                    <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.balanceToDo)}</td>
+                    <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.balanceToDo < 0 ? STATUS_COLORS.ahead : "inherit" }}>{fmtN(totals.balanceToDo)}</td>
                     <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varTotal >= 0 ? "#1B8A3A" : "#C00000" }}>{totals.varTotal >= 0 ? "+" : ""}{fmtN(totals.varTotal)}</td>
                     <td className="num" style={{ ...styles.td, fontWeight: 700, color: totals.varPct >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(totals.varPct)}</td>
                     {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.fyForecast)}</td>}
@@ -3567,6 +3645,12 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear }
               </>
             )}
           </table>
+          </div>
+          {/* Scroll affordance — only visible while there's more content to
+              the right, not a static decoration. */}
+          {showScrollFade && (
+            <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 28, pointerEvents: "none", background: "linear-gradient(to right, rgba(255,255,255,0), rgba(255,255,255,0.95))" }} />
+          )}
         </div>
       </div>
 
@@ -3589,22 +3673,52 @@ function SortableTh({ label, sortKeyName, sortKey, sortDir, onSort }) {
   );
 }
 
-function AttentionCard({ label, value, color, onClick, active }) {
+// `icon` is optional (backward compatible) — same extension pattern as
+// KpiCard's icon/pill props on Overview.
+function AttentionCard({ label, value, color, onClick, active, icon: Icon }) {
   return (
     <button onClick={onClick} style={{ ...styles.panel, textAlign: "left", cursor: "pointer", border: active ? `2px solid ${color}` : styles.panel.border, padding: 14 }}>
-      <div style={{ fontSize: 11, color: "#6B6B6B", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+        {Icon && <Icon size={12} color={color} />}
+        <div style={{ fontSize: 11, color: "#6B6B6B", fontWeight: 600 }}>{label}</div>
+      </div>
       <div style={{ fontSize: 22, fontWeight: 700, color }}>{value}</div>
     </button>
   );
 }
 
-function ManagementForecastCell({ vendor, value, onSave, fmtN }) {
+// Icon per status bucket, per the redesign spec's taxonomy table — shared
+// by both Vendor and Region status badges (STATUS_LABELS/STATUS_COLORS
+// are the same shared constants both already use).
+const STATUS_ICONS = {
+  needs_attention: AlertTriangle,
+  margin_risk: AlertTriangle,
+  watch: AlertTriangle,
+  ahead: TrendingUp,
+  on_track: Check,
+};
+function StatusBadge({ status }) {
+  const Icon = STATUS_ICONS[status];
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 5, color: "#FFFFFF", background: STATUS_COLORS[status] }}>
+      {Icon && <Icon size={10} />}
+      {STATUS_LABELS[status]}
+    </span>
+  );
+}
+
+// `flagged` = row status is needs_attention/margin_risk/watch — when true
+// AND no forecast is set yet, shows a small nudge icon, since these are
+// exactly the vendors where a management override is most useful and,
+// today, most often missing.
+function ManagementForecastCell({ vendor, value, onSave, fmtN, flagged }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(value != null ? String(Math.round(value)) : "");
   if (!editing) {
     return (
-      <span onClick={() => { setVal(value != null ? String(Math.round(value)) : ""); setEditing(true); }} style={{ cursor: "pointer", borderBottom: "1px dashed #C0C0C0" }} title="Click to set a management forecast">
-        {value != null ? fmtN(value) : "— set —"}
+      <span onClick={() => { setVal(value != null ? String(Math.round(value)) : ""); setEditing(true); }} style={{ cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 4 }} title={flagged && value == null ? "Flagged vendor with no management forecast set yet" : "Click to set a management forecast"}>
+        {flagged && value == null && <AlertTriangle size={11} color={STATUS_COLORS.watch} />}
+        <span style={{ borderBottom: "1px dashed #C0C0C0" }}>{value != null ? fmtN(value) : "— set —"}</span>
       </span>
     );
   }
@@ -3658,11 +3772,12 @@ function FormulasModal({ onClose }) {
           <div>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#6B6B6B", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 10 }}>Status</div>
             <div style={{ fontSize: 12.5, marginBottom: 10 }}>Considers both revenue pace and margin health — a vendor can hit its revenue number on razor-thin GP% and still be flagged.</div>
-            <Row label="Margin Risk" formula="Actual GP% is 3+ percentage points below Budget GP%" note="Checked first — takes priority over revenue pace, regardless of how revenue is tracking." />
-            <Row label="Needs Attention" formula="YTD Revenue Achievement % < 80%" note="YTD Revenue Achievement % = Actual Revenue (YTD) ÷ YTD Budget." />
+            <Row label="Needs Attention" formula="YTD Revenue Achievement % < 80%" note="Checked FIRST — a severe revenue miss is the most material issue, even for a vendor that's also margin-behind. YTD Revenue Achievement % = Actual Revenue (YTD) ÷ YTD Budget." />
+            <Row label="Margin Risk" formula="Actual GP% is 3+ percentage points below Budget GP%" note="Checked second — still overrides Ahead: strong revenue on poor margin isn't a good-news story." />
+            <Row label="Ahead" formula="YTD Revenue Achievement % > 115%" note="Significantly above plan — a distinct outlier flag, not the same as On Track." />
             <Row label="Watch" formula="YTD Revenue Achievement % between 80% and 95%" />
-            <Row label="On Track" formula="Everything else — 95%+ achievement with no margin gap" />
-            <div style={{ fontSize: 11, color: "#8A8A8A", marginTop: 4 }}>These thresholds (3pts, 80%, 95%) are a reasonable starting point, not a validated policy — worth tuning if they don't match how the business actually thinks about "at risk."</div>
+            <Row label="On Track" formula="Everything else — 95-115% achievement with no margin gap" />
+            <div style={{ fontSize: 11, color: "#8A8A8A", marginTop: 4 }}>These thresholds (3pts, 80%, 95%, 115%) are a reasonable starting point, not a validated policy — worth tuning if they don't match how the business actually thinks about "at risk."</div>
           </div>
         </div>
 
@@ -3851,18 +3966,15 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
     });
   }, [regions, year]);
 
-  const belowPlanCount = enriched.filter(r => r.ytdVarAmt < 0).length;
-  const atRiskCount = enriched.filter(r => r.status === "margin_risk").length;
-  const gpBelowBudgetCount = enriched.filter(r => r.actualGpPct < r.budgetGpPct - 0.01).length;
-  const aheadCount = enriched.filter(r => r.ytdVarPct > 0.15).length;
+  const needsAttentionCount = enriched.filter(r => r.status === "needs_attention").length;
+  const marginRiskCount = enriched.filter(r => r.status === "margin_risk").length;
+  const watchCount = enriched.filter(r => r.status === "watch").length;
+  const aheadCount = enriched.filter(r => r.status === "ahead").length;
 
   const filtered = useMemo(() => {
     let rows = enriched;
     if (regionSearch) rows = rows.filter(r => r.name.toLowerCase().includes(regionSearch.toLowerCase()));
-    if (quickFilter === "needs_attention") rows = rows.filter(r => r.status === "needs_attention");
-    else if (quickFilter === "margin_risk") rows = rows.filter(r => r.status === "margin_risk");
-    else if (quickFilter === "on_track") rows = rows.filter(r => r.status === "on_track");
-    else if (quickFilter === "ahead") rows = rows.filter(r => r.ytdVarPct > 0.15);
+    if (quickFilter !== "all") rows = rows.filter(r => r.status === quickFilter);
     return [...rows].sort((a, b) => {
       const dir = sortDir === "asc" ? 1 : -1;
       return ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir;
@@ -3926,10 +4038,10 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
 
       {!completed && !isBudgetingOrFuture && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
-          <AttentionCard label="Below Plan" value={belowPlanCount} color="#C00000" onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
-          <AttentionCard label="At Risk" value={atRiskCount} color="#7A3F9A" onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
-          <AttentionCard label="GP% Below Budget" value={gpBelowBudgetCount} color="#8A6D1A" onClick={() => setMetricView("gp")} active={metricView === "gp"} />
-          <AttentionCard label="Significantly Ahead" value={aheadCount} color="#1B8A3A" onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+          <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
+          <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
+          <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
+          <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
         </div>
       )}
 
@@ -4003,7 +4115,7 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
                       <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.name}</td>
                       {!completed && (
                         <td style={{ ...styles.td, textAlign: "left" }}>
-                          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 5, color: "#FFFFFF", background: STATUS_COLORS[r.status] }}>{STATUS_LABELS[r.status]}</span>
+                          <StatusBadge status={r.status} />
                         </td>
                       )}
                       <td className="num" style={styles.td}>{fmtN(r[budgetKey])}</td>
@@ -5456,6 +5568,13 @@ const styles = {
   // it stays above sticky body cells at the top-left intersection.
   thStickyCol: { position: "sticky", left: 0, zIndex: 3, background: "#FFFFFF" },
   tdStickyCol: { position: "sticky", left: 0, zIndex: 1, background: "#FFFFFF" },
+  // Second frozen column (Vendors table only — "Vendor + Status" per the
+  // redesign spec). The first sticky column above only ever needed
+  // `left:0`; a second one needs a fixed, known offset, which means the
+  // first column's width can no longer be content-driven/auto — see
+  // VENDOR_COL_WIDTH where this is used.
+  thStickyCol2: { position: "sticky", left: 190, zIndex: 3, background: "#FFFFFF" },
+  tdStickyCol2: { position: "sticky", left: 190, zIndex: 1, background: "#FFFFFF" },
   tr: { borderBottom: "1px solid #F0F0F0" },
   td: { padding: "9px 10px", textAlign: "right", whiteSpace: "nowrap" },
   editableCell: { cursor: "pointer", borderBottom: "1px dashed #8A8A8A", paddingBottom: 1 },

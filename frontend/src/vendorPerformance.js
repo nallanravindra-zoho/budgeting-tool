@@ -82,16 +82,28 @@ export function computeFySystemForecast(vendorRow, year) {
 }
 
 // ---- Vendor status ----------------------------------------------------------
-// Four tiers, considering BOTH revenue pace and margin health — a vendor
+// Five tiers, considering BOTH revenue pace and margin health — a vendor
 // hitting its revenue number on razor-thin GP% is still a real problem,
-// which "On Track" based on revenue alone would hide.
+// which "On Track" based on revenue alone would hide. Also used as-is by
+// RegionPerformanceView (same function, same constants) — a fix here is a
+// fix there too, deliberately (see the redesign spec's Vendors §2, which
+// found identical taxonomy bugs already present in both places).
 //
 // Thresholds are a reasonable starting point, not a validated policy —
 // flag if these should be tuned or made configurable later:
-//   - Margin Risk: actual GP% is 3+ points below budgeted GP% (any revenue pace)
-//   - Needs Attention: YTD revenue achievement < 80% of YTD budget
-//   - Watch: YTD revenue achievement 80-95%
-//   - On Track: everything else (95%+ achievement, healthy margin)
+//   - Needs Attention: YTD revenue achievement < 80% of YTD budget — a
+//     severe miss, checked FIRST (previously Margin Risk was checked
+//     first, which mislabeled a vendor with BOTH a severe revenue miss
+//     AND a margin gap as "Margin Risk" instead of the more material
+//     "Needs Attention" — e.g. a vendor at -71.8% YTD revenue variance).
+//   - Margin Risk: actual GP% is 3+ points below budgeted GP% — checked
+//     second, still overrides "Ahead": a vendor with strong revenue but
+//     poor margin should not read as a good-news story (same principle
+//     the chat assistant's own system prompt already states).
+//   - Ahead: YTD revenue achievement > 115% (i.e. YTD variance % > 15%,
+//     the same constant already used elsewhere for "Significantly Ahead").
+//   - Watch: YTD revenue achievement 80-95%.
+//   - On Track: everything else (95-115% achievement, healthy margin).
 export function computeVendorStatus(vendorRow) {
   // Zero budget with real actuals means there's nothing to genuinely be
   // "on track" against — the vendor likely started transacting outside
@@ -106,8 +118,9 @@ export function computeVendorStatus(vendorRow) {
   const actualGpPct = vendorRow.actual_revenue_ytd > 0 ? vendorRow.actual_gp_ytd / vendorRow.actual_revenue_ytd : 0;
   const gpPtsBehind = (budgetGpPct - actualGpPct) * 100;
 
-  if (gpPtsBehind >= 3) return "margin_risk";
   if (ytdAchievementPct < 0.80) return "needs_attention";
+  if (gpPtsBehind >= 3) return "margin_risk";
+  if (ytdAchievementPct > 1.15) return "ahead";
   if (ytdAchievementPct < 0.95) return "watch";
   return "on_track";
 }
@@ -117,12 +130,14 @@ export const STATUS_LABELS = {
   watch: "Watch",
   needs_attention: "Needs Attention",
   margin_risk: "Margin Risk",
+  ahead: "Ahead",
 };
 export const STATUS_COLORS = {
   on_track: "#1B8A3A",
   watch: "#8A6D1A",
   needs_attention: "#C00000",
-  margin_risk: "#7A3F9A",
+  margin_risk: "#C97A2B",
+  ahead: "#2E5FA3",
 };
 
 // ---- Management Forecast (editable override, alongside System Forecast) ----
