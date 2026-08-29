@@ -1692,7 +1692,7 @@ function KeyDriversPanel({ movers, marginDetractors, regionMovers, regionLoading
             <div key={v.vendor} style={{ marginBottom: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
                 <span>{v.vendor}</span>
-                <span className="num" style={{ color: v.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedN(v.varAmt, fmtN)} ({fmtSignedPct(v.ytd_budget_revenue ? v.varAmt / v.ytd_budget_revenue : 0)})</span>
+                <span className="num" style={{ color: v.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedN(v.varAmt, fmtN)} ({fmtN(v.ytd_budget_revenue)})</span>
               </div>
               <MiniBar value={v.varAmt} max={maxContributorAbs} color={v.varAmt >= 0 ? "#1B8A3A" : "#C00000"} />
             </div>
@@ -1720,7 +1720,7 @@ function KeyDriversPanel({ movers, marginDetractors, regionMovers, regionLoading
             <div key={r.name} style={{ marginBottom: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
                 <span>{r.name}</span>
-                <span className="num" style={{ color: r.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedN(r.varAmt, fmtN)} ({fmtSignedPct(r.ytd_budget_revenue ? r.varAmt / r.ytd_budget_revenue : 0)})</span>
+                <span className="num" style={{ color: r.varAmt >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedN(r.varAmt, fmtN)} ({fmtN(r.ytd_budget_revenue)})</span>
               </div>
               <MiniBar value={r.varAmt} max={maxRegionAbs} color={r.varAmt >= 0 ? "#1B8A3A" : "#C00000"} />
             </div>
