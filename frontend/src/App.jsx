@@ -1499,7 +1499,7 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
       <ManagementSnapshot kpis={kpis} marginDetractors={marginDetractors} fmtN={fmtN} onNavigate={onNavigate} />
 
       <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginBottom: 10 }}>
-        <div style={styles.plViewToggle}>
+        <div style={{ ...styles.plViewToggle, marginBottom: 0 }}>
           {[["monthly", "Monthly"], ["quarterly", "Quarterly"], ["yearly", "Yearly"]].map(([k, label]) => (
             <button key={k} onClick={() => setViewMode(k)} style={{ ...styles.plToggleBtn, ...(viewMode === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
           ))}
@@ -3664,7 +3664,7 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
           {tierOptions.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
         {!completed && !isBudgetingOrFuture && (
-          <div style={styles.plViewToggle}>
+          <div style={{ ...styles.plViewToggle, marginBottom: 0 }}>
             {QUICK_FILTERS.map(([k, label]) => (
               <button key={k} onClick={() => setQuickFilter(k)} style={{ ...styles.plToggleBtn, ...(quickFilter === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
             ))}
@@ -4286,13 +4286,13 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 6, alignItems: "center" }}>
         <div style={styles.searchBox}><Search size={14} color="#6B6B6B" /><input value={regionSearch} onChange={(e) => setRegionSearch(e.target.value)} placeholder={`Search ${granularityLabel[granularity].toLowerCase()}…`} style={styles.searchInput} /></div>
-        <div style={styles.plViewToggle}>
+        <div style={{ ...styles.plViewToggle, marginBottom: 0 }}>
           {[["region", "Region"], ["subRegion", "Sub-Region"], ["country", "Country"]].map(([k, label]) => (
             <button key={k} onClick={() => setGranularity(k)} style={{ ...styles.plToggleBtn, ...(granularity === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
           ))}
         </div>
         {!completed && !isBudgetingOrFuture && (
-          <div style={styles.plViewToggle}>
+          <div style={{ ...styles.plViewToggle, marginBottom: 0 }}>
             {QUICK_FILTERS.map(([k, label]) => (
               <button key={k} onClick={() => setQuickFilter(k)} style={{ ...styles.plToggleBtn, ...(quickFilter === k ? styles.plToggleBtnActive : {}) }}>{label}</button>
             ))}
