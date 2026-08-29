@@ -1107,17 +1107,11 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
           <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
         </div>
         <button onClick={onSave} style={styles.primaryBtn}><Save size={15} style={{ marginRight: 6 }} /> Save Version</button>
-        {auth.currentUser && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
-            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
-            <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
-          </div>
-        )}
-        {/* Sync cluster — rightmost element in the bar. Button on top,
-            persisted "Last synced" timestamp underneath (prefers this
-            session's own sync click; falls back to lastSyncedAt read back
-            from Firestore, written by syncCipr, so it survives a reload
-            instead of resetting to "not synced" every time). */}
+        {/* Sync cluster. Button on top, persisted "Last synced" timestamp
+            underneath (prefers this session's own sync click; falls back
+            to lastSyncedAt read back from Firestore, written by syncCipr,
+            so it survives a reload instead of resetting to "not synced"
+            every time). */}
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
           <button
             onClick={onSync} disabled={syncing}
@@ -1131,6 +1125,13 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
             {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
           </div>
         </div>
+        {/* User name (no email) + sign-out — now the rightmost element. */}
+        {auth.currentUser && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
+            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
+            <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
+          </div>
+        )}
       </div>
     </header>
   );
