@@ -1005,7 +1005,7 @@ export default function App() {
           {effectiveTab === "regions" && (
             isEditableYear
               ? <RegionsTab regions={regionRows} />
-              : <RegionPerformanceView year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} scenario={scenario} />
+              : <RegionPerformanceView year={year} showToast={showToast} activeBudgetingYear={activeBudgetingYear} scenario={scenario} lastSyncedAt={lastSyncedAt || persistedLastSyncedAt} />
           )}
           {effectiveTab === "pl" && <PLTab alloc={plAllocation} />}
           {effectiveTab === "otherExpenses" && <OtherExpensesTab showToast={showToast} year={year} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />}
@@ -3381,6 +3381,7 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
   const marginRiskCount = enriched.filter(v => v.status === "margin_risk").length;
   const watchCount = enriched.filter(v => v.status === "watch").length;
   const aheadCount = enriched.filter(v => v.status === "ahead").length;
+  const onTrackCount = enriched.filter(v => v.status === "on_track").length;
 
   const filtered = useMemo(() => {
     let rows = enriched;
@@ -3479,11 +3480,12 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
           against). Completed years have nothing left to track; budgeting/
           future years have no actuals yet to compute status from at all. */}
       {!completed && !isBudgetingOrFuture && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 14 }}>
           <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
           <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
           <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
           <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+          <AttentionCard label={STATUS_LABELS.on_track} value={onTrackCount} color={STATUS_COLORS.on_track} icon={Check} onClick={() => setQuickFilter("on_track")} active={quickFilter === "on_track"} />
         </div>
       )}
 
@@ -3512,14 +3514,18 @@ function VendorPerformanceView({ vendors, year, showToast, activeBudgetingYear, 
             ))}
           </div>
         )}
-        <select value={sortKey} onChange={(e) => setSortKey(e.target.value)} style={styles.yearSelect}>
-          {(isBudgetingOrFuture ? [["budget_revenue", "Budget Revenue"], ["budget_gp", "Budget GP"]]
-            : completed ? SORT_OPTIONS.filter(([k]) => !k.startsWith("forecast") && k !== "ytdVarAmt" && k !== "ytdAchievementPct" && k !== "ytdGpVarAmt")
-            : SORT_OPTIONS).map(([k, label]) => <option key={k} value={k}>Sort: {label}</option>)}
-        </select>
-        <button onClick={() => setSortDir(d => d === "asc" ? "desc" : "asc")} style={styles.iconBtnGhost} title="Reverse sort direction">
-          <ChevronDown size={14} style={{ transform: sortDir === "asc" ? "none" : "rotate(180deg)" }} />
-        </button>
+        {/* Pushed to the right edge of the row, separate from the
+            search/filter/pill cluster on the left. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+          <select value={sortKey} onChange={(e) => setSortKey(e.target.value)} style={styles.yearSelect}>
+            {(isBudgetingOrFuture ? [["budget_revenue", "Budget Revenue"], ["budget_gp", "Budget GP"]]
+              : completed ? SORT_OPTIONS.filter(([k]) => !k.startsWith("forecast") && k !== "ytdVarAmt" && k !== "ytdAchievementPct" && k !== "ytdGpVarAmt")
+              : SORT_OPTIONS).map(([k, label]) => <option key={k} value={k}>Sort: {label}</option>)}
+          </select>
+          <button onClick={() => setSortDir(d => d === "asc" ? "desc" : "asc")} style={styles.iconBtnGhost} title="Reverse sort direction">
+            <ChevronDown size={14} style={{ transform: sortDir === "asc" ? "none" : "rotate(180deg)" }} />
+          </button>
+        </div>
       </div>
 
       <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
@@ -3909,7 +3915,7 @@ function DrilldownStat({ label, value, color }) {
 // was scoped as a per-vendor judgment call in the original ask; flagging
 // this as an intentional omission, not an oversight, in case regions
 // should have one too.
-function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario }) {
+function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario, lastSyncedAt }) {
   const { fmtN } = useNumberUnit();
   const completed = isYearCompleted(year);
   const yearClass = classifyYear(year, activeBudgetingYear);
@@ -3926,6 +3932,14 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
   const [sortDir, setSortDir] = useState("desc");
   const [drilldownRegion, setDrilldownRegion] = useState(null);
   const [formulasOpen, setFormulasOpen] = useState(false);
+  // Right-edge scroll-fade affordance, same as VendorPerformanceView.
+  const tableScrollRef = useRef(null);
+  const [showScrollFade, setShowScrollFade] = useState(false);
+  const checkScrollFade = () => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    setShowScrollFade(el.scrollWidth > el.clientWidth + 2 && el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -3970,6 +3984,7 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
   const marginRiskCount = enriched.filter(r => r.status === "margin_risk").length;
   const watchCount = enriched.filter(r => r.status === "watch").length;
   const aheadCount = enriched.filter(r => r.status === "ahead").length;
+  const onTrackCount = enriched.filter(r => r.status === "on_track").length;
 
   const filtered = useMemo(() => {
     let rows = enriched;
@@ -3980,6 +3995,8 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
       return ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir;
     });
   }, [enriched, regionSearch, quickFilter, sortKey, sortDir]);
+
+  useEffect(() => { checkScrollFade(); }, [filtered, metricView, completed, isBudgetingOrFuture, granularity]);
 
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -4019,10 +4036,15 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
-          {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
-            : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
-            : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+        <div>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
+            {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
+              : isBudgetingOrFuture ? `FY ${year} Budget (${YEAR_CLASSIFICATION_LABELS[yearClass]}) — no actuals yet`
+              : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+          </div>
+          <div style={{ fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
+            {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+          </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button onClick={() => setFormulasOpen(true)} style={{ ...styles.secondaryBtn, fontSize: 12 }} title="How these numbers are calculated">ƒ Formulas</button>
@@ -4037,11 +4059,12 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
       {formulasOpen && <FormulasModal onClose={() => setFormulasOpen(false)} />}
 
       {!completed && !isBudgetingOrFuture && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 14 }}>
           <AttentionCard label={STATUS_LABELS.needs_attention} value={needsAttentionCount} color={STATUS_COLORS.needs_attention} icon={AlertTriangle} onClick={() => setQuickFilter("needs_attention")} active={quickFilter === "needs_attention"} />
           <AttentionCard label={STATUS_LABELS.margin_risk} value={marginRiskCount} color={STATUS_COLORS.margin_risk} icon={AlertTriangle} onClick={() => setQuickFilter("margin_risk")} active={quickFilter === "margin_risk"} />
           <AttentionCard label={STATUS_LABELS.watch} value={watchCount} color={STATUS_COLORS.watch} icon={AlertTriangle} onClick={() => setQuickFilter("watch")} active={quickFilter === "watch"} />
           <AttentionCard label={STATUS_LABELS.ahead} value={aheadCount} color={STATUS_COLORS.ahead} icon={TrendingUp} onClick={() => setQuickFilter("ahead")} active={quickFilter === "ahead"} />
+          <AttentionCard label={STATUS_LABELS.on_track} value={onTrackCount} color={STATUS_COLORS.on_track} icon={Check} onClick={() => setQuickFilter("on_track")} active={quickFilter === "on_track"} />
         </div>
       )}
 
@@ -4066,9 +4089,14 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
         </div>
       )}
 
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
+        Showing {filtered.length} of {enriched.length} {granularityLabel[granularity].toLowerCase()}{enriched.length === 1 ? "" : "s"}
+      </div>
+
       <div style={styles.panel}>
         {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : filtered.length === 0 ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>No data for this filter.</div> : (
-        <div style={styles.tableScroll}>
+        <div style={{ position: "relative" }}>
+        <div style={styles.tableScroll} ref={tableScrollRef} onScroll={checkScrollFade}>
           <table style={styles.table}>
             {isBudgetingOrFuture ? (
               <>
@@ -4097,8 +4125,8 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
               <>
                 <thead>
                   <tr>
-                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left" }}>{granularityLabel[granularity]}</th>
-                    {!completed && <th style={{ ...styles.th, textAlign: "left" }}>Status</th>}
+                    <th style={{ ...styles.th, ...styles.thStickyCol, textAlign: "left", width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH }}>{granularityLabel[granularity]}</th>
+                    {!completed && <th style={{ ...styles.th, ...styles.thStickyCol2, textAlign: "left" }}>Status</th>}
                     <SortableTh label="FY Budget" sortKeyName={budgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
                     {!completed && <SortableTh label="YTD Budget" sortKeyName={ytdBudgetKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />}
                     <SortableTh label={completed ? "FY Actual" : "YTD Actual"} sortKeyName={actualKey} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
@@ -4110,12 +4138,21 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(r => (
+                  {filtered.map(r => {
+                    const gpPtsBehind = (r.budgetGpPct - r.actualGpPct) * 100;
+                    return (
                     <tr key={r.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
-                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.name}</td>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.name}>{r.name}</td>
                       {!completed && (
-                        <td style={{ ...styles.td, textAlign: "left" }}>
-                          <StatusBadge status={r.status} />
+                        <td style={{ ...styles.td, ...styles.tdStickyCol2, textAlign: "left" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                            <StatusBadge status={r.status} />
+                            {r.status === "margin_risk" && (
+                              <span style={{ fontSize: 9.5, fontWeight: 600, padding: "1px 6px", borderRadius: 4, color: KPI_TIER_COLORS.bad.fg, background: KPI_TIER_COLORS.bad.bg }}>
+                                GP -{gpPtsBehind.toFixed(1)} pts
+                              </span>
+                            )}
+                          </div>
                         </td>
                       )}
                       <td className="num" style={styles.td}>{fmtN(r[budgetKey])}</td>
@@ -4127,12 +4164,13 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
                       {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{r[forecastVarKey] >= 0 ? "+" : ""}{fmtN(r[forecastVarKey])}</td>}
                       {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(r[forecastVarPctKey])}</td>}
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: "2px solid #111111" }}>
-                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700 }}>Total</td>
-                    {!completed && <td style={styles.td}></td>}
+                    <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 700, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH }}>Total</td>
+                    {!completed && <td style={{ ...styles.td, ...styles.tdStickyCol2 }}></td>}
                     <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.budget)}</td>
                     {!completed && <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.ytdBudget)}</td>}
                     <td className="num" style={{ ...styles.td, fontWeight: 700 }}>{fmtN(totals.actual)}</td>
@@ -4146,6 +4184,10 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario 
               </>
             )}
           </table>
+        </div>
+          {showScrollFade && (
+            <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 28, pointerEvents: "none", background: "linear-gradient(to right, rgba(255,255,255,0), rgba(255,255,255,0.95))" }} />
+          )}
         </div>
         )}
       </div>
