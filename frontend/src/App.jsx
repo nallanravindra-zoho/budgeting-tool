@@ -3231,7 +3231,12 @@ function EmployeePieChart({ data }) {
       <PieChart>
         <Pie
           data={data} dataKey="value" nameKey="name" cx="38%" cy="50%" outerRadius={110}
-          labelLine={false} label={({ percent }) => `${(percent * 100).toFixed(0)}%`}
+          labelLine={false}
+          // Computed from `value`/`total` ourselves rather than trusting
+          // recharts' own `percent` argument — that was intermittently
+          // wrong for one slice (showing "0%" while the tooltip, computed
+          // this same way, correctly showed the real share).
+          label={({ value }) => `${total ? ((value / total) * 100).toFixed(0) : 0}%`}
         >
           {data.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
         </Pie>
