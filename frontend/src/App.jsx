@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
-import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, Info, AlertTriangle, Target, Lightbulb, MoreVertical, Download, Presentation } from "lucide-react";
+import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, AlertTriangle, Target, Lightbulb, MoreVertical, Download, Presentation } from "lucide-react";
 import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
 import { exportOverviewToPpt } from "./pptExport.js";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, updateVersion as updateVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
@@ -1017,6 +1017,7 @@ export default function App() {
             <OverviewTab
               kpis={kpis} monthlyData={monthlyData} monthlyGpData={monthlyGpData} scenario={scenario} activeBudgetingYear={activeBudgetingYear}
               year={year} movers={movers} marginDetractors={marginDetractors} onNavigate={setTab} enrichedVendors={enrichedVendors} showToast={showToast}
+              lastSyncedAt={lastSyncedAt || persistedLastSyncedAt}
             />
           )}
           {effectiveTab === "vendors" && (
@@ -1110,68 +1111,25 @@ function scaleGrid(grid, ratio) {
 
 /* ============================= TOP-LEVEL SUBCOMPONENTS ============================= */
 
+// Single-row header — per direct feedback that the earlier multi-line
+// version (brand/tagline/date/freshness stacked, plus a whole separate
+// toggle row) wasted vertical space that page content could use instead.
+// The "Data as of / Actuals through" freshness line that used to live
+// here is gone entirely — each page now shows its own "Actuals through"
+// line (Overview/Vendors/Regions), the same pattern Vendors/Regions
+// already used, so nothing is lost, just relocated.
 function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, year, activeBudgetingYear, lastSyncedAt, availableYears, onYearChange, isEditableYear, displayName }) {
   const { unit, setUnit } = useNumberUnit();
-  const today = new Date();
-  const todayLabel = today.toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
-  const shortDateLabel = today.toLocaleDateString("en-US", { day: "numeric", month: "short", year: "numeric" });
-  const cutoffIdx = getActualCutoffMonthIndex(year);
   return (
-    <header style={{ ...styles.topBar, flexDirection: "column", alignItems: "stretch", gap: 12 }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", rowGap: 6 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+    <header style={styles.topBar}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", rowGap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={styles.logoMark}>CK</div>
-          <div>
-            <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
-            <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
-            <div style={styles.brandSub}>{todayLabel}</div>
-            {/* Explicit freshness line — so it's clear at a glance whether the
-                numbers on screen are current, without hunting for the sync
-                icon. cutoffIdx can be -1 (no closed months yet, e.g. a future
-                year not underway) — guarded to avoid an "Actuals through
-                undefined" label in that case. */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
-              <span>Data as of {shortDateLabel}</span>
-              <Info size={11} style={{ flexShrink: 0 }} title="Today's date — the app doesn't back-date figures; every number reflects data synced as of this moment." />
-              {cutoffIdx >= 0 && (<><span>|</span><span>Actuals through {MONTHS[cutoffIdx]} {year}</span></>)}
-            </div>
-          </div>
+          <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
         </div>
 
         <YearSelector year={year} availableYears={availableYears} onYearChange={onYearChange} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {/* Sync cluster. Button on top, persisted "Last synced" timestamp
-              underneath (prefers this session's own sync click; falls back
-              to lastSyncedAt read back from Firestore, written by syncCipr,
-              so it survives a reload instead of resetting to "not synced"
-              every time). */}
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-            <button
-              onClick={onSync} disabled={syncing}
-              style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1.5px solid #2E5FA3", color: "#2E5FA3", borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, cursor: syncing ? "default" : "pointer" }}
-              title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}
-            >
-              <RefreshCw size={14} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
-              Sync Now
-            </button>
-            <div style={{ fontSize: 10, color: "#8A8A8A", whiteSpace: "nowrap" }}>
-              {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
-            </div>
-          </div>
-          {/* User name (no email) + sign-out — rightmost element. */}
-          {auth.currentUser && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
-              <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
-              <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Moved here (left-aligned, below the brand/freshness block) per
-          direct feedback — previously sat in the right-hand cluster above. */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <div style={styles.unitToggle} title="Number display unit — applies everywhere">
           {[["millions", "M"], ["thousands", "K"], ["full", "Full"]].map(([val, label]) => (
             <button key={val} onClick={() => setUnit(val)} style={{ ...styles.unitToggleBtn, ...(unit === val ? styles.unitToggleBtnActive : {}) }} title={`Show all figures in ${val}`}>{label}</button>
@@ -1181,7 +1139,38 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
           <button onClick={() => setScenario("Macnica")} style={{ ...styles.scenarioBtn, ...(scenario === "Macnica" ? styles.scenarioBtnActive : {}) }}>Macnica</button>
           <button onClick={() => setScenario("SKO")} style={{ ...styles.scenarioBtn, ...(scenario === "SKO" ? { ...styles.scenarioBtnActive, background: "#111111", color: "#FFFFFF" } : {}) }}>SKO (+{Math.round(skoUplift * 100)}%)</button>
         </div>
-        <button onClick={onSave} style={styles.primaryBtn}><Save size={15} style={{ marginRight: 6 }} /> Save Version</button>
+        {/* Icon-only, tooltip carries the label — was a labeled button. */}
+        <button onClick={onSave} style={{ background: "#C00000", border: "none", borderRadius: 7, width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center", color: "#FFFFFF", cursor: "pointer", flexShrink: 0 }} title="Save Version">
+          <Save size={15} />
+        </button>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {/* Sync cluster. Button on top, persisted "Last synced" timestamp
+            underneath (prefers this session's own sync click; falls back
+            to lastSyncedAt read back from Firestore, written by syncCipr,
+            so it survives a reload instead of resetting to "not synced"
+            every time). */}
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+          <button
+            onClick={onSync} disabled={syncing}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1.5px solid #2E5FA3", color: "#2E5FA3", borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, cursor: syncing ? "default" : "pointer" }}
+            title={`Pull latest actuals for ${year} from Zoho Analytics — manual only, no automatic schedule`}
+          >
+            <RefreshCw size={14} style={syncing ? { animation: "spin 1s linear infinite" } : {}} />
+            Sync Now
+          </button>
+          <div style={{ fontSize: 10, color: "#8A8A8A", whiteSpace: "nowrap" }}>
+            {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+          </div>
+        </div>
+        {/* User name (no email) + sign-out — rightmost element. */}
+        {auth.currentUser && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, paddingLeft: 10, borderLeft: "1px solid #E0E0E0" }}>
+            <span style={{ fontSize: 12, color: "#6B6B6B" }}>{displayName}</span>
+            <button onClick={signOutUser} style={styles.iconBtnGhost} title="Sign out">⎋</button>
+          </div>
+        )}
       </div>
     </header>
   );
@@ -1402,7 +1391,7 @@ function actualEndpointDot(cutoffIdx, viewMode) {
   };
 }
 
-function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, enrichedVendors, showToast }) {
+function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgetingYear, year, movers, marginDetractors, onNavigate, enrichedVendors, showToast, lastSyncedAt }) {
   const { fmtN, unit } = useNumberUnit();
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "quarterly" | "yearly"
   const [yearlyRaw, setYearlyRaw] = useState(null);
@@ -1535,9 +1524,24 @@ function OverviewTab({ kpis, monthlyData, monthlyGpData, scenario, activeBudgeti
   const gpChartData = viewMode === "monthly" ? monthlyGpData : viewMode === "quarterly" ? quarterlyGpData : yearlyGpData;
   const periodLabel = { monthly: "Monthly", quarterly: "Quarterly", yearly: "By Year (last 5 years)" }[viewMode];
   const cutoffIdx = getActualCutoffMonthIndex(year);
+  const completed = isYearCompleted(year);
+  const yearClass = classifyYear(year, activeBudgetingYear);
 
   return (
     <div style={{ animation: "fadeIn .3s ease" }}>
+      {/* Same "Actuals through / Last synced" pattern already used on
+          Vendors and Regions — now removed from the global TopBar, so
+          each page shows its own. */}
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 600, color: "#6B6B6B" }}>
+          {completed ? `FY ${year} — Actuals through December (${YEAR_CLASSIFICATION_LABELS[yearClass]})`
+            : `Actuals through ${MONTHS[cutoffIdx] || MONTHS[0]} ${year} (${YEAR_CLASSIFICATION_LABELS[yearClass]})`}
+        </div>
+        <div style={{ fontSize: 10.5, color: "#8A8A8A", marginTop: 2 }}>
+          {lastSyncedAt ? `Last synced: ${lastSyncedAt.toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" })}, ${lastSyncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "Not synced yet"}
+        </div>
+      </div>
+
       <div style={styles.kpiGrid}>
         <KpiCard
           label="YTD Revenue (Actual)" value={fmtN(kpis.totalActualYtd)}
