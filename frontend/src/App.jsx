@@ -1111,21 +1111,26 @@ function scaleGrid(grid, ratio) {
 
 /* ============================= TOP-LEVEL SUBCOMPONENTS ============================= */
 
-// Single-row header — per direct feedback that the earlier multi-line
-// version (brand/tagline/date/freshness stacked, plus a whole separate
-// toggle row) wasted vertical space that page content could use instead.
-// The "Data as of / Actuals through" freshness line that used to live
-// here is gone entirely — each page now shows its own "Actuals through"
-// line (Overview/Vendors/Regions), the same pattern Vendors/Regions
-// already used, so nothing is lost, just relocated.
+// Single-row header for the controls — per direct feedback that the
+// earlier multi-line version (a whole separate toggle row, plus the
+// "Data as of / Actuals through" freshness line) wasted vertical space
+// that page content could use instead. The brand column (title/tagline/
+// date) still stacks 3 lines — that part was never the complaint, and
+// was asked back explicitly — everything else sits beside it in one row,
+// vertically centered against that taller column.
 function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, year, activeBudgetingYear, lastSyncedAt, availableYears, onYearChange, isEditableYear, displayName }) {
   const { unit, setUnit } = useNumberUnit();
+  const todayLabel = new Date().toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
   return (
     <header style={styles.topBar}>
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", rowGap: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={styles.logoMark}>CK</div>
-          <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
+          <div>
+            <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
+            <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
+            <div style={styles.brandSub}>{todayLabel}</div>
+          </div>
         </div>
 
         <YearSelector year={year} availableYears={availableYears} onYearChange={onYearChange} isEditableYear={isEditableYear} activeBudgetingYear={activeBudgetingYear} />
