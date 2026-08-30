@@ -3145,36 +3145,16 @@ function EmployeesTab({ showToast, year }) {
       {departmentData.length > 0 && (
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Headcount by Department</div>
-          <ResponsiveContainer width="100%" height={Math.max(180, departmentData.length * 32)}>
-            <BarChart data={departmentData} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-              <XAxis type="number" allowDecimals={false} fontSize={12} stroke="#6B6B6B" />
-              <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={140} />
-              <Tooltip contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
-              <Bar dataKey="value" radius={[0, 4, 4, 0]}>
-                {departmentData.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
-                <LabelList dataKey="value" position="right" fontSize={12} fill="#111111" />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+          <EmployeePieChart data={departmentData} />
         </div>
       )}
 
       {locationData.length > 0 && (
         <div style={styles.panel}>
-          <div style={styles.panelTitle}>Headcount by Location</div>
-          <ResponsiveContainer width="100%" height={Math.max(180, locationData.length * 32)}>
-            <BarChart data={locationData} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
-              <XAxis type="number" allowDecimals={false} fontSize={12} stroke="#6B6B6B" />
-              <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={140} />
-              <Tooltip contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
-              <Bar dataKey="value" radius={[0, 4, 4, 0]}>
-                {locationData.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
-                <LabelList dataKey="value" position="right" fontSize={12} fill="#111111" />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+          {/* "Location" here = each employee's country field — see
+              computeEmployeeDashboardStats' byLocation in employeeData.js. */}
+          <div style={styles.panelTitle}>Headcount by Country</div>
+          <EmployeePieChart data={locationData} />
         </div>
       )}
 
@@ -3234,6 +3214,27 @@ function EmployeesTab({ showToast, year }) {
         )}
       </div>
     </div>
+  );
+}
+
+// Shared by the Department/Country headcount panels — a pie instead of
+// the previous horizontal bar list, each slice labeled with its % share
+// of total headcount (not just the raw count).
+function EmployeePieChart({ data }) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  return (
+    <ResponsiveContainer width="100%" height={320}>
+      <PieChart>
+        <Pie
+          data={data} dataKey="value" nameKey="name" cx="38%" cy="50%" outerRadius={110}
+          labelLine={false} label={({ percent }) => `${(percent * 100).toFixed(0)}%`}
+        >
+          {data.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+        </Pie>
+        <Tooltip formatter={(value, name) => [`${value} (${total ? ((value / total) * 100).toFixed(1) : 0}%)`, name]} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+        <Legend layout="vertical" align="right" verticalAlign="middle" wrapperStyle={{ fontSize: 11.5 }} />
+      </PieChart>
+    </ResponsiveContainer>
   );
 }
 
