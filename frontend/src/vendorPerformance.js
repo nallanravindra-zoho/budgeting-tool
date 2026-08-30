@@ -8,7 +8,7 @@
  * keeps the original simple budgeting table untouched, per the explicit
  * requirement to not clutter the budget-entry workflow.
  */
-import { getFirestore, collection, doc, getDoc, getDocs, setDoc, Timestamp } from "firebase/firestore";
+import { getFirestore, collection, doc, getDoc, getDocs, setDoc, query, where, Timestamp } from "firebase/firestore";
 import { app } from "./firebase.js";
 import { getActualCutoffMonthIndex } from "./firestoreData.js";
 
@@ -180,28 +180,37 @@ export async function setManagementForecast(year, vendorName, revenue, updatedBy
 // a variant spelling), same known risk flagged for subRegion matching
 // earlier. Region/subRegion levels don't have this problem since both
 // budget and actuals already carry those exact attributes directly.
-export async function getRegionPerformanceData(year, granularity, scenario = "Macnica") {
-  let [budgetSnap, invoicesSnap] = await Promise.all([
-    getDocs(collection(db, "zohoBudgets", String(year), "regionBudgets")),
-    getDocs(collection(db, "ciprActuals", String(year), "invoices")),
-  ]);
+// Shared fetch — `filters` is an array of [field, value] equality
+// constraints applied to BOTH the budget and invoice queries (e.g.
+// [["subRegion", "GULF"]] to scope a child breakdown to one parent).
+// Empty/omitted filters = the original whole-year fetch.
+async function fetchRegionSnaps(year, filters = []) {
+  const applyFilters = (coll) => filters.reduce((acc, [f, v]) => query(acc, where(f, "==", v)), coll);
+  let budgetSnap = await getDocs(applyFilters(collection(db, "zohoBudgets", String(year), "regionBudgets")));
+  const invoicesSnap = await getDocs(applyFilters(collection(db, "ciprActuals", String(year), "invoices")));
   // Same fallback as getVendors()/getRegions() in firestoreData.js: real
   // synced data always wins; this only fires when nothing has ever been
   // synced for this year (a genuinely future year with only a growth
   // projection, if one was generated).
   if (budgetSnap.empty) {
-    budgetSnap = await getDocs(collection(db, "budgetProjections", String(year), "regionBudgets"));
+    budgetSnap = await getDocs(applyFilters(collection(db, "budgetProjections", String(year), "regionBudgets")));
   }
+  return { budgetSnap, invoicesSnap };
+}
 
+// Groups already-fetched budget/invoice snapshots by `groupField`
+// ("region" | "subRegion" | "country") into the same row shape
+// getRegionPerformanceData has always returned. Split out so the child
+// drill-down fetch (getRegionChildBreakdown) can reuse it on a
+// pre-filtered snapshot instead of duplicating the aggregation logic.
+function aggregateRegionGroups(budgetSnap, invoicesSnap, groupField, scenario, year) {
   const keyForBudgetDoc = (id, data) => {
-    if (granularity === "country") return decodeURIComponent(id);
-    if (granularity === "region") return data.region || "(unassigned)";
-    return data.subRegion || "(unassigned)"; // subRegion
+    if (groupField === "country") return decodeURIComponent(id);
+    return data[groupField] || "(unassigned)"; // region | subRegion
   };
   const keyForInvoiceRow = (row) => {
-    if (granularity === "country") return row.billingCountry || "(unassigned)";
-    if (granularity === "region") return row.region || "(unassigned)";
-    return row.subRegion || "(unassigned)"; // subRegion
+    if (groupField === "country") return row.billingCountry || "(unassigned)";
+    return row[groupField] || "(unassigned)"; // region | subRegion
   };
 
   const groups = {}; // name -> { budget_revenue, budget_gp, monthly_budget_revenue[12], actual_revenue_ytd, actual_gp_ytd, monthly_actual_revenue[12], monthly_actual_gp[12] }
@@ -253,4 +262,29 @@ export async function getRegionPerformanceData(year, granularity, scenario = "Ma
       ytd_budget_gp: g.monthly_budget_revenue.slice(0, cutoffIdx + 1).reduce((s, v) => s + v, 0) * blendedGpPct,
     };
   }).sort((a, b) => b.budget_revenue - a.budget_revenue);
+}
+
+// granularity: "region" | "subRegion" | "country". Country-level budget
+// comes from the country-wise view's "Country" field; country-level
+// actuals come from CIPR's "Billing Country" field — these are DIFFERENT
+// source columns and may not always match by name (e.g. "Saudi Arabia" vs
+// a variant spelling), same known risk flagged for subRegion matching
+// earlier. Region/subRegion levels don't have this problem since both
+// budget and actuals already carry those exact attributes directly.
+export async function getRegionPerformanceData(year, granularity, scenario = "Macnica") {
+  const { budgetSnap, invoicesSnap } = await fetchRegionSnaps(year);
+  return aggregateRegionGroups(budgetSnap, invoicesSnap, granularity, scenario, year);
+}
+
+// One-level drill-down used by the Regions tab's row-expand feature:
+// given a parent row at `parentField` granularity ("region" | "subRegion")
+// with value `parentName`, returns its breakdown at the next-finer
+// `childField` ("subRegion" | "country") — e.g. region="Gulf" ->
+// childField="country" returns UAE/Kuwait/Qatar/Bahrain/Oman. Reuses the
+// same Firestore-side `where()` filter on both the budget and invoice
+// queries, so this fetches only the parent's own rows rather than the
+// whole year like the top-level table does.
+export async function getRegionChildBreakdown(year, parentField, parentName, childField, scenario = "Macnica") {
+  const { budgetSnap, invoicesSnap } = await fetchRegionSnaps(year, [[parentField, parentName]]);
+  return aggregateRegionGroups(budgetSnap, invoicesSnap, childField, scenario, year);
 }

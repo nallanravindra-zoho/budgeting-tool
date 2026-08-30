@@ -5,7 +5,7 @@ import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
 import { exportOverviewToPpt } from "./pptExport.js";
 import { getVendors, quickEditVendorBudget, applyVendorPlan as applyVendorPlanFn, getRegions, listSavedVersions, saveVersion as saveVersionFn, loadVersion as loadVersionFn, updateVersion as updateVersionFn, getActiveBudgetingYear, getAvailableYears, getActualCutoffMonthIndex, addVendor as addVendorFn, removeVendor as removeVendorFn, getVendorHistory, generateFutureBudgets, getMyAccessProfile } from "./firestoreData.js";
 import { getExpenseCategories, addExpenseCategory, removeExpenseCategory, getUnmappedAccounts, setGlAccountMapping, getCategoryRollup, getExpenseAgreements, addExpenseAgreement, updateExpenseAgreement, removeExpenseAgreement, getGrowthAssumptions, setGrowthAssumption, generateOtherExpensesBudget, getOtherExpensesBudget, overrideOtherExpensesBudgetLine } from "./otherExpensesData.js";
-import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData } from "./vendorPerformance.js";
+import { isYearCompleted, classifyYear, YEAR_CLASSIFICATION_LABELS, computeFySystemForecast, computeVendorStatus, STATUS_LABELS, STATUS_COLORS, getManagementForecasts, setManagementForecast, getRegionPerformanceData, getRegionChildBreakdown } from "./vendorPerformance.js";
 import { getEmployees, addEmployee, updateEmployee, resignEmployee, reinstateEmployee, deleteEmployee, setEmployeeHikes, getBenefitThresholds, setBenefitThresholds, computeEmployeeMonthlyCost, computeBenefitEligibility, computeEmployeeDashboardStats } from "./employeeData.js";
 import { getAssumptions, addAssumption, updateAssumption, removeAssumption, DEFAULT_ASSUMPTIONS } from "./assumptions.js";
 import { getInvoicesByYearRange, computeOperationalStats } from "./operationalStats.js";
@@ -4239,6 +4239,41 @@ function DrilldownStat({ label, value, color }) {
 // was scoped as a per-vendor judgment call in the original ask; flagging
 // this as an intentional omission, not an oversight, in case regions
 // should have one too.
+// Same forecast/status/variance derivation RegionPerformanceView applies to
+// its top-level rows, pulled out so the row-expand children (fetched via
+// getRegionChildBreakdown, one granularity level down) get identical
+// fields — StatusBadge, "GP -X pts" chip, etc. all just work on them too.
+function enrichRegionRow(r, year) {
+  const { fyForecastRevenue, fyForecastGp } = computeFySystemForecast(r, year);
+  const status = computeVendorStatus(r);
+  const ytdVarAmt = r.actual_revenue_ytd - r.ytd_budget_revenue;
+  const ytdVarPct = r.ytd_budget_revenue ? ytdVarAmt / r.ytd_budget_revenue : (r.actual_revenue_ytd > 0 ? 1 : 0);
+  const ytdGpVarAmt = r.actual_gp_ytd - r.ytd_budget_gp;
+  const ytdGpVarPct = r.ytd_budget_gp ? ytdGpVarAmt / r.ytd_budget_gp : 0;
+  const forecastVarAmt = fyForecastRevenue - r.budget_revenue;
+  const forecastVarPct = r.budget_revenue ? forecastVarAmt / r.budget_revenue : 0;
+  const forecastAchievementPct = r.budget_revenue ? fyForecastRevenue / r.budget_revenue : 0;
+  const forecastGpVarAmt = fyForecastGp - r.budget_gp;
+  const forecastGpVarPct = r.budget_gp ? forecastGpVarAmt / r.budget_gp : 0;
+  const fyVarAmt = r.actual_revenue_ytd - r.budget_revenue;
+  const fyVarPct = r.budget_revenue ? fyVarAmt / r.budget_revenue : 0;
+  const fyGpVarAmt = r.actual_gp_ytd - r.budget_gp;
+  const fyGpVarPct = r.budget_gp ? fyGpVarAmt / r.budget_gp : 0;
+  const actualGpPct = r.actual_revenue_ytd ? r.actual_gp_ytd / r.actual_revenue_ytd : 0;
+  const budgetGpPct = r.budget_revenue ? r.budget_gp / r.budget_revenue : 0;
+  return {
+    ...r, fyForecastRevenue, fyForecastGp, status,
+    ytdVarAmt, ytdVarPct, ytdGpVarAmt, ytdGpVarPct,
+    forecastVarAmt, forecastVarPct, forecastAchievementPct, forecastGpVarAmt, forecastGpVarPct,
+    fyVarAmt, fyVarPct, fyGpVarAmt, fyGpVarPct,
+    actualGpPct, budgetGpPct,
+  };
+}
+
+// One level finer than each granularity, for the row-expand feature —
+// "country" has no children (nothing finer exists), so it's absent here.
+const REGION_CHILD_GRANULARITY = { region: "subRegion", subRegion: "country" };
+
 function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario, lastSyncedAt }) {
   const { fmtN } = useNumberUnit();
   const completed = isYearCompleted(year);
@@ -4275,34 +4310,39 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
     return () => { cancelled = true; };
   }, [year, granularity, scenario]);
 
-  const enriched = useMemo(() => {
-    return regions.map(r => {
-      const { fyForecastRevenue, fyForecastGp } = computeFySystemForecast(r, year);
-      const status = computeVendorStatus(r);
-      const ytdVarAmt = r.actual_revenue_ytd - r.ytd_budget_revenue;
-      const ytdVarPct = r.ytd_budget_revenue ? ytdVarAmt / r.ytd_budget_revenue : (r.actual_revenue_ytd > 0 ? 1 : 0);
-      const ytdGpVarAmt = r.actual_gp_ytd - r.ytd_budget_gp;
-      const ytdGpVarPct = r.ytd_budget_gp ? ytdGpVarAmt / r.ytd_budget_gp : 0;
-      const forecastVarAmt = fyForecastRevenue - r.budget_revenue;
-      const forecastVarPct = r.budget_revenue ? forecastVarAmt / r.budget_revenue : 0;
-      const forecastAchievementPct = r.budget_revenue ? fyForecastRevenue / r.budget_revenue : 0;
-      const forecastGpVarAmt = fyForecastGp - r.budget_gp;
-      const forecastGpVarPct = r.budget_gp ? forecastGpVarAmt / r.budget_gp : 0;
-      const fyVarAmt = r.actual_revenue_ytd - r.budget_revenue;
-      const fyVarPct = r.budget_revenue ? fyVarAmt / r.budget_revenue : 0;
-      const fyGpVarAmt = r.actual_gp_ytd - r.budget_gp;
-      const fyGpVarPct = r.budget_gp ? fyGpVarAmt / r.budget_gp : 0;
-      const actualGpPct = r.actual_revenue_ytd ? r.actual_gp_ytd / r.actual_revenue_ytd : 0;
-      const budgetGpPct = r.budget_revenue ? r.budget_gp / r.budget_revenue : 0;
-      return {
-        ...r, fyForecastRevenue, fyForecastGp, status,
-        ytdVarAmt, ytdVarPct, ytdGpVarAmt, ytdGpVarPct,
-        forecastVarAmt, forecastVarPct, forecastAchievementPct, forecastGpVarAmt, forecastGpVarPct,
-        fyVarAmt, fyVarPct, fyGpVarAmt, fyGpVarPct,
-        actualGpPct, budgetGpPct,
-      };
+  const enriched = useMemo(() => regions.map(r => enrichRegionRow(r, year)), [regions, year]);
+
+  // Row-expand ("GULF" -> UAE/Kuwait/Qatar/Bahrain/Oman): expandedNames is
+  // which parent rows are currently open; childrenByParent caches the
+  // fetched-and-enriched breakdown per parent name (undefined = not yet
+  // fetched, "loading" = in flight). Both reset whenever the granularity/
+  // year/scenario changes, since a child fetch is scoped to a specific
+  // parent field + value at the CURRENT granularity level.
+  const [expandedNames, setExpandedNames] = useState(() => new Set());
+  const [childrenByParent, setChildrenByParent] = useState({});
+  const childGranularity = REGION_CHILD_GRANULARITY[granularity]; // undefined at "country" — nothing finer
+  useEffect(() => { setExpandedNames(new Set()); setChildrenByParent({}); }, [year, granularity, scenario]);
+
+  const toggleExpand = (e, r) => {
+    e.stopPropagation(); // don't also trigger the row's own onClick (opens the chart modal)
+    if (!childGranularity) return;
+    setExpandedNames(prev => {
+      const next = new Set(prev);
+      if (next.has(r.name)) { next.delete(r.name); return next; }
+      next.add(r.name);
+      if (childrenByParent[r.name] === undefined) {
+        setChildrenByParent(cp => ({ ...cp, [r.name]: "loading" }));
+        getRegionChildBreakdown(year, granularity, r.name, childGranularity, scenario)
+          .then(rows => setChildrenByParent(cp => ({ ...cp, [r.name]: rows.map(row => enrichRegionRow(row, year)) })))
+          .catch(err => {
+            console.error("getRegionChildBreakdown failed:", err);
+            showToast(`Couldn't load ${r.name} breakdown: ${err.message}`);
+            setChildrenByParent(cp => ({ ...cp, [r.name]: [] }));
+          });
+      }
+      return next;
     });
-  }, [regions, year]);
+  };
 
   const needsAttentionCount = enriched.filter(r => r.status === "needs_attention").length;
   const marginRiskCount = enriched.filter(r => r.status === "margin_risk").length;
@@ -4452,12 +4492,37 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(r => (
-                    <tr key={r.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
-                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>{r.name}</td>
+                  {filtered.map(r => {
+                    const isExpanded = expandedNames.has(r.name);
+                    const children = childrenByParent[r.name];
+                    return (
+                    <React.Fragment key={r.name}>
+                    <tr className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600 }}>
+                        {childGranularity && (
+                          <span onClick={(e) => toggleExpand(e, r)} title={childGranularity === "country" ? "Expand for country breakdown (budget vs. actuals country names may not always match exactly)" : `Expand for ${granularityLabel[childGranularity].toLowerCase()} breakdown`} style={{ display: "inline-flex", verticalAlign: -2, marginRight: 5, cursor: "pointer" }}>
+                            {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                          </span>
+                        )}
+                        {r.name}
+                      </td>
                       <td className="num" style={styles.td}>{fmtN(r[budgetKey])}</td>
                     </tr>
-                  ))}
+                    {isExpanded && (
+                      children === "loading" ? (
+                        <tr style={styles.tr}><td colSpan={2} style={{ ...styles.td, color: "#8A8A8A", fontSize: 11.5 }}>Loading…</td></tr>
+                      ) : (children || []).length === 0 ? (
+                        <tr style={styles.tr}><td colSpan={2} style={{ ...styles.td, color: "#8A8A8A", fontSize: 11.5 }}>No breakdown available.</td></tr>
+                      ) : (children || []).map(c => (
+                        <tr key={c.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer", background: "#FAFAF8" }} onClick={() => setDrilldownRegion(c)}>
+                          <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", paddingLeft: 30, color: "#6B6B6B" }}>{c.name}</td>
+                          <td className="num" style={{ ...styles.td, color: "#6B6B6B" }}>{fmtN(c[budgetKey])}</td>
+                        </tr>
+                      ))
+                    )}
+                    </React.Fragment>
+                    );
+                  })}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: "2px solid #111111" }}>
@@ -4485,9 +4550,20 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
                 <tbody>
                   {filtered.map(r => {
                     const gpPtsBehind = (r.budgetGpPct - r.actualGpPct) * 100;
+                    const isExpanded = expandedNames.has(r.name);
+                    const children = childrenByParent[r.name];
+                    const childColCount = 5 + (!completed ? 5 : 0);
                     return (
-                    <tr key={r.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
-                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.name}>{r.name}</td>
+                    <React.Fragment key={r.name}>
+                    <tr className="row-hover" style={{ ...styles.tr, cursor: "pointer" }} onClick={() => setDrilldownRegion(r)}>
+                      <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", fontWeight: 600, width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.name}>
+                        {childGranularity && (
+                          <span onClick={(e) => toggleExpand(e, r)} title={childGranularity === "country" ? "Expand for country breakdown (budget vs. actuals country names may not always match exactly)" : `Expand for ${granularityLabel[childGranularity].toLowerCase()} breakdown`} style={{ display: "inline-flex", verticalAlign: -2, marginRight: 5, cursor: "pointer" }}>
+                            {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                          </span>
+                        )}
+                        {r.name}
+                      </td>
                       {!completed && (
                         <td style={{ ...styles.td, ...styles.tdStickyCol2, textAlign: "left" }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
@@ -4509,6 +4585,41 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
                       {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{r[forecastVarKey] >= 0 ? "+" : ""}{fmtN(r[forecastVarKey])}</td>}
                       {!completed && <td className="num" style={{ ...styles.td, color: r[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(r[forecastVarPctKey])}</td>}
                     </tr>
+                    {isExpanded && (
+                      children === "loading" ? (
+                        <tr style={styles.tr}><td colSpan={childColCount} style={{ ...styles.td, color: "#8A8A8A", fontSize: 11.5 }}>Loading…</td></tr>
+                      ) : (children || []).length === 0 ? (
+                        <tr style={styles.tr}><td colSpan={childColCount} style={{ ...styles.td, color: "#8A8A8A", fontSize: 11.5 }}>No breakdown available.</td></tr>
+                      ) : (children || []).map(c => {
+                        const cGpPtsBehind = (c.budgetGpPct - c.actualGpPct) * 100;
+                        return (
+                        <tr key={c.name} className="row-hover" style={{ ...styles.tr, cursor: "pointer", background: "#FAFAF8" }} onClick={() => setDrilldownRegion(c)}>
+                          <td style={{ ...styles.td, ...styles.tdStickyCol, textAlign: "left", width: VENDOR_COL_WIDTH, minWidth: VENDOR_COL_WIDTH, maxWidth: VENDOR_COL_WIDTH, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingLeft: 30, color: "#6B6B6B" }} title={c.name}>{c.name}</td>
+                          {!completed && (
+                            <td style={{ ...styles.td, ...styles.tdStickyCol2, textAlign: "left" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                                <StatusBadge status={c.status} />
+                                {c.status === "margin_risk" && (
+                                  <span style={{ fontSize: 9.5, fontWeight: 600, padding: "1px 6px", borderRadius: 4, color: KPI_TIER_COLORS.bad.fg, background: KPI_TIER_COLORS.bad.bg }}>
+                                    GP -{cGpPtsBehind.toFixed(1)} pts
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                          )}
+                          <td className="num" style={{ ...styles.td, color: "#6B6B6B" }}>{fmtN(c[budgetKey])}</td>
+                          {!completed && <td className="num" style={{ ...styles.td, color: "#6B6B6B" }}>{fmtN(c[ytdBudgetKey])}</td>}
+                          <td className="num" style={{ ...styles.td, color: "#6B6B6B" }}>{fmtN(c[actualKey])}</td>
+                          <td className="num" style={{ ...styles.td, color: c[completed ? fyVarKey : varKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{c[completed ? fyVarKey : varKey] >= 0 ? "+" : ""}{fmtN(c[completed ? fyVarKey : varKey])}</td>
+                          <td className="num" style={{ ...styles.td, color: c[completed ? fyVarPctKey : varPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(c[completed ? fyVarPctKey : varPctKey])}</td>
+                          {!completed && <td className="num" style={{ ...styles.td, color: "#6B6B6B" }}>{fmtN(c[fyForecastKey])}</td>}
+                          {!completed && <td className="num" style={{ ...styles.td, color: c[forecastVarKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{c[forecastVarKey] >= 0 ? "+" : ""}{fmtN(c[forecastVarKey])}</td>}
+                          {!completed && <td className="num" style={{ ...styles.td, color: c[forecastVarPctKey] >= 0 ? "#1B8A3A" : "#C00000" }}>{fmtSignedPct(c[forecastVarPctKey])}</td>}
+                        </tr>
+                        );
+                      })
+                    )}
+                    </React.Fragment>
                     );
                   })}
                 </tbody>
