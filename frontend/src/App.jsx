@@ -3142,19 +3142,23 @@ function EmployeesTab({ showToast, year }) {
         </div>
       )}
 
-      {departmentData.length > 0 && (
-        <div style={styles.panel}>
-          <div style={styles.panelTitle}>Headcount by Department</div>
-          <EmployeePieChart data={departmentData} />
-        </div>
-      )}
+      {(departmentData.length > 0 || locationData.length > 0) && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+          {departmentData.length > 0 && (
+            <div style={styles.panel}>
+              <div style={styles.panelTitle}>Headcount by Department</div>
+              <EmployeePieChart data={departmentData} />
+            </div>
+          )}
 
-      {locationData.length > 0 && (
-        <div style={styles.panel}>
-          {/* "Location" here = each employee's country field — see
-              computeEmployeeDashboardStats' byLocation in employeeData.js. */}
-          <div style={styles.panelTitle}>Headcount by Country</div>
-          <EmployeePieChart data={locationData} />
+          {locationData.length > 0 && (
+            <div style={styles.panel}>
+              {/* "Location" here = each employee's country field — see
+                  computeEmployeeDashboardStats' byLocation in employeeData.js. */}
+              <div style={styles.panelTitle}>Headcount by Country</div>
+              <EmployeePieChart data={locationData} />
+            </div>
+          )}
         </div>
       )}
 
