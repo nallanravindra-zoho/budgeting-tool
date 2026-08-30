@@ -4338,6 +4338,8 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
   const actualKey = metricView === "gp" ? "actual_gp_ytd" : "actual_revenue_ytd";
   const fyForecastKey = metricView === "gp" ? "fyForecastGp" : "fyForecastRevenue";
   const granularityLabel = { region: "Region", subRegion: "Sub-Region", country: "Country" };
+  // Irregular plural ("country" -> "countries") — plain +"s" elsewhere is fine.
+  const granularityLabelPlural = { region: "Regions", subRegion: "Sub-Regions", country: "Countries" };
 
   // Same totals-row convention as VendorPerformanceView — sums the
   // filtered/searched list, Var% derived from summed budget & actual
@@ -4537,7 +4539,7 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
 
       {/* Moved below the table to match Vendors — was above it before. */}
       <div style={{ fontSize: 11.5, color: "#8A8A8A", marginTop: 8 }}>
-        Showing {filtered.length} of {enriched.length} {granularityLabel[granularity].toLowerCase()}{enriched.length === 1 ? "" : "s"}
+        Showing {filtered.length} of {enriched.length} {(enriched.length === 1 ? granularityLabel[granularity] : granularityLabelPlural[granularity]).toLowerCase()}
       </div>
 
       {drilldownRegion && (
@@ -4924,14 +4926,41 @@ function OperationalStatsTab({ showToast, year }) {
 
       <div style={styles.panel}>
         <div style={styles.panelTitle}>GP% Buckets — Margin Distribution</div>
-        <ResponsiveContainer width="100%" height={220}>
-          <BarChart data={stats.gpBuckets} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={stats.gpBuckets} margin={{ top: 28, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
             <XAxis dataKey="label" fontSize={12} stroke="#6B6B6B" />
             <YAxis fontSize={12} stroke="#6B6B6B" allowDecimals={false} />
-            <Tooltip formatter={(v, name) => name === "count" ? `${v} deals` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            <Tooltip
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null;
+                const b = payload[0].payload;
+                const totalBucketRevenue = stats.gpBuckets.reduce((s, r) => s + (r.revenue || 0), 0);
+                const pct = totalBucketRevenue ? (b.revenue / totalBucketRevenue) * 100 : 0;
+                return (
+                  <div style={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, padding: "8px 10px", fontSize: 12 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>{b.label}</div>
+                    <div>{b.count} deal{b.count === 1 ? "" : "s"}</div>
+                    <div>{fmtFull(b.revenue)} ({pct.toFixed(1)}% of total revenue)</div>
+                  </div>
+                );
+              }}
+            />
             <Bar dataKey="count" name="count" radius={[4, 4, 0, 0]}>
               {stats.gpBuckets.map((_, i) => <Cell key={i} fill={DEPT_COLORS[(i + 6) % DEPT_COLORS.length]} />)}
+              <LabelList
+                dataKey="count" position="top"
+                content={({ x, y, width, index }) => {
+                  const b = stats.gpBuckets[index];
+                  const totalBucketRevenue = stats.gpBuckets.reduce((s, r) => s + (r.revenue || 0), 0);
+                  const pct = totalBucketRevenue ? (b.revenue / totalBucketRevenue) * 100 : 0;
+                  return (
+                    <text x={x + width / 2} y={y - 8} textAnchor="middle" fontSize={10.5} fill="#333333">
+                      {fmtN(b.revenue)} ({pct.toFixed(0)}%)
+                    </text>
+                  );
+                }}
+              />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -4941,18 +4970,48 @@ function OperationalStatsTab({ showToast, year }) {
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Segment-wise Revenue (ZTX Framework)</div>
           <ResponsiveContainer width="100%" height={Math.max(160, stats.segments.length * 32)}>
-            <BarChart data={stats.segments} layout="vertical" margin={{ top: 6, right: 30, left: 0, bottom: 0 }}>
+            <BarChart data={stats.segments} layout="vertical" margin={{ top: 6, right: 70, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
               <XAxis type="number" fontSize={12} stroke="#6B6B6B" tickFormatter={(v) => fmtN(v)} />
               <YAxis type="category" dataKey="name" fontSize={12} stroke="#6B6B6B" width={160} />
-              <Tooltip formatter={(v) => fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+              <Tooltip
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null;
+                  const s = payload[0].payload;
+                  const totalSegRevenue = stats.segments.reduce((sum, r) => sum + (r.revenue || 0), 0);
+                  const pct = totalSegRevenue ? (s.revenue / totalSegRevenue) * 100 : 0;
+                  return (
+                    <div style={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, padding: "8px 10px", fontSize: 12 }}>
+                      <div style={{ fontWeight: 600, marginBottom: 4 }}>{s.name}</div>
+                      <div>{s.count} deal{s.count === 1 ? "" : "s"}</div>
+                      <div>{fmtFull(s.revenue)} ({pct.toFixed(1)}% of total revenue)</div>
+                    </div>
+                  );
+                }}
+              />
               <Bar dataKey="revenue" radius={[0, 4, 4, 0]}>
                 {stats.segments.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+                <LabelList
+                  dataKey="revenue" position="right"
+                  content={({ x, y, width, height, index }) => {
+                    const s = stats.segments[index];
+                    const totalSegRevenue = stats.segments.reduce((sum, r) => sum + (r.revenue || 0), 0);
+                    const pct = totalSegRevenue ? (s.revenue / totalSegRevenue) * 100 : 0;
+                    return (
+                      <text x={x + width + 6} y={y + height / 2} dominantBaseline="middle" fontSize={10.5} fill="#333333">
+                        {fmtN(s.revenue)} ({pct.toFixed(0)}%)
+                      </text>
+                    );
+                  }}
+                />
               </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
       )}
+      {/* Multi-Year Trend below is a count-over-years line chart (Invoices/
+          Vendors/Customers/...), not a per-category revenue distribution —
+          the revenue-sum/%-share treatment above doesn't apply to it. */}
 
       {stats.trend.length > 1 && (
         <div style={styles.panel}>
