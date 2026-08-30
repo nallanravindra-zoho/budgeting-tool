@@ -175,11 +175,16 @@ export async function setManagementForecast(year, vendorName, revenue, updatedBy
 //
 // granularity: "region" | "subRegion" | "country". Country-level budget
 // comes from the country-wise view's "Country" field; country-level
-// actuals come from CIPR's "Billing Country" field — these are DIFFERENT
-// source columns and may not always match by name (e.g. "Saudi Arabia" vs
-// a variant spelling), same known risk flagged for subRegion matching
-// earlier. Region/subRegion levels don't have this problem since both
-// budget and actuals already carry those exact attributes directly.
+// actuals come from CIPR's "End Customer Country" field (NOT "Billing
+// Country" — Billing Country is the invoicing entity's country, e.g. a
+// UAE-entity invoice billed to an overseas reseller, which scattered
+// Sub-Region -> Country drill-downs across unrelated countries; End
+// Customer Country is who actually bought it) — these are still
+// DIFFERENT source columns from the budget side and may not always
+// match by name (e.g. "Saudi Arabia" vs a variant spelling), same known
+// risk flagged for subRegion matching earlier. Region/subRegion levels
+// don't have this problem since both budget and actuals already carry
+// those exact attributes directly.
 // Shared fetch — `filters` is an array of [field, value] equality
 // constraints applied to BOTH the budget and invoice queries (e.g.
 // [["subRegion", "GULF"]] to scope a child breakdown to one parent).
@@ -209,7 +214,13 @@ function aggregateRegionGroups(budgetSnap, invoicesSnap, groupField, scenario, y
     return data[groupField] || "(unassigned)"; // region | subRegion
   };
   const keyForInvoiceRow = (row) => {
-    if (groupField === "country") return row.billingCountry || "(unassigned)";
+    // Country grouping uses END CUSTOMER country, not Billing Country —
+    // Billing Country reflects the invoicing entity (e.g. a UAE-entity
+    // invoice billed to an overseas partner/reseller), which scattered
+    // Sub-Region -> Country drill-downs across unrelated countries. End
+    // Customer Country is who actually bought/used it, which is what a
+    // geographic breakdown is meant to answer.
+    if (groupField === "country") return row.endCustomerCountry || "(unassigned)";
     return row[groupField] || "(unassigned)"; // region | subRegion
   };
 
@@ -266,11 +277,16 @@ function aggregateRegionGroups(budgetSnap, invoicesSnap, groupField, scenario, y
 
 // granularity: "region" | "subRegion" | "country". Country-level budget
 // comes from the country-wise view's "Country" field; country-level
-// actuals come from CIPR's "Billing Country" field — these are DIFFERENT
-// source columns and may not always match by name (e.g. "Saudi Arabia" vs
-// a variant spelling), same known risk flagged for subRegion matching
-// earlier. Region/subRegion levels don't have this problem since both
-// budget and actuals already carry those exact attributes directly.
+// actuals come from CIPR's "End Customer Country" field (NOT "Billing
+// Country" — Billing Country is the invoicing entity's country, e.g. a
+// UAE-entity invoice billed to an overseas reseller, which scattered
+// Sub-Region -> Country drill-downs across unrelated countries; End
+// Customer Country is who actually bought it) — these are still
+// DIFFERENT source columns from the budget side and may not always
+// match by name (e.g. "Saudi Arabia" vs a variant spelling), same known
+// risk flagged for subRegion matching earlier. Region/subRegion levels
+// don't have this problem since both budget and actuals already carry
+// those exact attributes directly.
 export async function getRegionPerformanceData(year, granularity, scenario = "Macnica") {
   const { budgetSnap, invoicesSnap } = await fetchRegionSnaps(year);
   return aggregateRegionGroups(budgetSnap, invoicesSnap, granularity, scenario, year);

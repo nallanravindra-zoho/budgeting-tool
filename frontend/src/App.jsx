@@ -4474,7 +4474,7 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
       </div>
       {granularity === "country" && (
         <div style={{ fontSize: 11, color: "#8A8A8A", marginBottom: 14 }}>
-          Country-level budget and actuals come from different source columns (Zoho's budget "Country" field vs. CIPR's "Billing Country") and may not always match by name — Region and Sub-Region granularity don't have this risk, since both sources carry those exact same attributes.
+          Country-level budget and actuals come from different source columns (Zoho's budget "Country" field vs. CIPR's "End Customer Country") and may not always match by name — Region and Sub-Region granularity don't have this risk, since both sources carry those exact same attributes.
         </div>
       )}
 
