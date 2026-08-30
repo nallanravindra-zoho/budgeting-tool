@@ -3232,11 +3232,17 @@ function EmployeePieChart({ data }) {
         <Pie
           data={data} dataKey="value" nameKey="name" cx="38%" cy="50%" outerRadius={110}
           labelLine={false}
-          // Computed from `value`/`total` ourselves rather than trusting
-          // recharts' own `percent` argument — that was intermittently
-          // wrong for one slice (showing "0%" while the tooltip, computed
-          // this same way, correctly showed the real share).
-          label={({ value }) => `${total ? ((value / total) * 100).toFixed(0) : 0}%`}
+          // Neither recharts' `percent` NOR its `value` argument can be
+          // trusted here — both were wrong for one slice specifically
+          // when multiple slices tie on the same count (confirmed: this
+          // data has 3 departments genuinely tied at the same headcount).
+          // `index` is just the sector's position in our own `data` array
+          // though, unaffected by that — read the real value straight
+          // from `data` by index instead of anything recharts hands back.
+          label={({ index }) => {
+            const v = data[index]?.value ?? 0;
+            return `${total ? ((v / total) * 100).toFixed(0) : 0}%`;
+          }}
         >
           {data.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
         </Pie>
