@@ -1125,7 +1125,12 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
   return (
     <header style={styles.topBar}>
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", rowGap: 8 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {/* alignItems: "stretch" (not "center") so the logo's flex-item
+            height equals the 3-line text column's natural height — the
+            <img>'s height:100%/objectFit:contain then scales it to match,
+            instead of a guessed fixed px that drifts whenever the text
+            block's height changes (e.g. tagline wrapping). */}
+        <div style={{ display: "flex", alignItems: "stretch", gap: 10 }}>
           <img src={logo} alt="CyberKnight" style={styles.logoMark} />
           <div>
             <div style={styles.brandTitle}>Budget Desk</div>
@@ -6219,7 +6224,7 @@ const styles = {
   appRoot: { fontFamily: "'Inter', sans-serif", background: "#FFFFFF", color: "#111111", height: "100vh", width: "100%", display: "flex", flexDirection: "column", overflow: "hidden" },
   topBar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
   yearRow: { padding: "10px 24px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
-  logoMark: { height: 34, width: "auto", display: "block", objectFit: "contain" },
+  logoMark: { height: "100%", width: "auto", display: "block", objectFit: "contain" },
   brandTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 17, lineHeight: 1.1 },
   brandSub: { fontSize: 11.5, color: "#6B6B6B", marginTop: 2 },
   scenarioToggle: { display: "flex", background: "#FFFFFF", borderRadius: 8, padding: 3, border: "1px solid #E0E0E0" },
