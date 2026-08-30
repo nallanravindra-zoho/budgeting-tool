@@ -3224,6 +3224,29 @@ function EmployeesTab({ showToast, year }) {
 // Shared by the Department/Country headcount panels — a pie instead of
 // the previous horizontal bar list, each slice labeled with its % share
 // of total headcount (not just the raw count).
+const PIE_LABEL_RADIAN = Math.PI / 180;
+// Renders the % INSIDE each slice (at 60% out from center) instead of
+// outside it — an outside label can run past the edge of a half-width
+// panel (confirmed: correct before the two pies went side by side, wrong
+// after — a clipped "20%" losing its leading digit reads as "0%", which
+// matches exactly what was reported). Inside the slice, it can't clip
+// regardless of container width. Still reads value by `index` from our
+// own `data` array, not anything recharts hands back (see prior fix).
+function renderInsidePieLabel(data, total) {
+  return ({ cx, cy, midAngle, innerRadius, outerRadius, index }) => {
+    const radius = innerRadius + (outerRadius - innerRadius) * 0.6;
+    const x = cx + radius * Math.cos(-midAngle * PIE_LABEL_RADIAN);
+    const y = cy + radius * Math.sin(-midAngle * PIE_LABEL_RADIAN);
+    const v = data[index]?.value ?? 0;
+    const pct = total ? Math.round((v / total) * 100) : 0;
+    return (
+      <text x={x} y={y} fill="#FFFFFF" textAnchor="middle" dominantBaseline="central" fontSize={13} fontWeight={700}>
+        {pct}%
+      </text>
+    );
+  };
+}
+
 function EmployeePieChart({ data }) {
   const total = data.reduce((s, d) => s + d.value, 0);
   return (
@@ -3231,18 +3254,7 @@ function EmployeePieChart({ data }) {
       <PieChart>
         <Pie
           data={data} dataKey="value" nameKey="name" cx="38%" cy="50%" outerRadius={110}
-          labelLine={false}
-          // Neither recharts' `percent` NOR its `value` argument can be
-          // trusted here — both were wrong for one slice specifically
-          // when multiple slices tie on the same count (confirmed: this
-          // data has 3 departments genuinely tied at the same headcount).
-          // `index` is just the sector's position in our own `data` array
-          // though, unaffected by that — read the real value straight
-          // from `data` by index instead of anything recharts hands back.
-          label={({ index }) => {
-            const v = data[index]?.value ?? 0;
-            return `${total ? ((v / total) * 100).toFixed(0) : 0}%`;
-          }}
+          labelLine={false} label={renderInsidePieLabel(data, total)}
         >
           {data.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
         </Pie>
