@@ -2637,7 +2637,7 @@ function AgreementsView({ agreements, categories, topLevelCategories, subcategor
   return (
     <div style={styles.panel}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-        <div style={styles.panelTitle}>Rent / Consultant / Subscription Agreements</div>
+        <div style={styles.panelTitle}>Rent / Consultant / Subscription Agreements {agreements.length > 0 && `(${agreements.length})`}</div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button onClick={() => { setEditing(null); setFormOpen(true); }} style={styles.primaryBtn}>+ Add Agreement</button>
           <ExportMenu getSheets={getExportSheets} filename="expense-agreements" />
@@ -3216,6 +3216,10 @@ function EmployeesTab({ showToast, year }) {
             </table>
           </div>
         )}
+      </div>
+
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginTop: 8 }}>
+        Showing {filtered.length} of {employees.length} employee{employees.length === 1 ? "" : "s"}
       </div>
     </div>
   );
@@ -4432,10 +4436,6 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
         </div>
       )}
 
-      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginBottom: 8 }}>
-        Showing {filtered.length} of {enriched.length} {granularityLabel[granularity].toLowerCase()}{enriched.length === 1 ? "" : "s"}
-      </div>
-
       <div style={styles.panel}>
         {loading ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>Loading…</div> : filtered.length === 0 ? <div style={{ fontSize: 12, color: "#6B6B6B" }}>No data for this filter.</div> : (
         <div style={{ position: "relative" }}>
@@ -4533,6 +4533,11 @@ function RegionPerformanceView({ year, showToast, activeBudgetingYear, scenario,
           )}
         </div>
         )}
+      </div>
+
+      {/* Moved below the table to match Vendors — was above it before. */}
+      <div style={{ fontSize: 11.5, color: "#8A8A8A", marginTop: 8 }}>
+        Showing {filtered.length} of {enriched.length} {granularityLabel[granularity].toLowerCase()}{enriched.length === 1 ? "" : "s"}
       </div>
 
       {drilldownRegion && (
@@ -4873,14 +4878,45 @@ function OperationalStatsTab({ showToast, year }) {
 
       <div style={styles.panel}>
         <div style={styles.panelTitle}>Revenue Buckets — Deal Size Distribution</div>
-        <ResponsiveContainer width="100%" height={220}>
-          <BarChart data={stats.revenueBuckets} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={stats.revenueBuckets} margin={{ top: 28, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#E0E0E0" />
             <XAxis dataKey="label" fontSize={12} stroke="#6B6B6B" />
             <YAxis fontSize={12} stroke="#6B6B6B" allowDecimals={false} />
-            <Tooltip formatter={(v, name) => name === "count" ? `${v} deals` : fmtFull(v)} contentStyle={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8 }} />
+            {/* Bars stay sized by deal COUNT (this is a deal-size
+                distribution) — revenue $ and its % share of total bucket
+                revenue are shown alongside, in the tooltip and as an
+                on-bar label, not by resizing the bars themselves. */}
+            <Tooltip
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null;
+                const b = payload[0].payload;
+                const totalBucketRevenue = stats.revenueBuckets.reduce((s, r) => s + (r.revenue || 0), 0);
+                const pct = totalBucketRevenue ? (b.revenue / totalBucketRevenue) * 100 : 0;
+                return (
+                  <div style={{ background: "#FFFFFF", border: "1px solid #E0E0E0", borderRadius: 8, padding: "8px 10px", fontSize: 12 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>{b.label}</div>
+                    <div>{b.count} deal{b.count === 1 ? "" : "s"}</div>
+                    <div>{fmtFull(b.revenue)} ({pct.toFixed(1)}% of total revenue)</div>
+                  </div>
+                );
+              }}
+            />
             <Bar dataKey="count" name="count" radius={[4, 4, 0, 0]}>
               {stats.revenueBuckets.map((_, i) => <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />)}
+              <LabelList
+                dataKey="count" position="top"
+                content={({ x, y, width, index }) => {
+                  const b = stats.revenueBuckets[index];
+                  const totalBucketRevenue = stats.revenueBuckets.reduce((s, r) => s + (r.revenue || 0), 0);
+                  const pct = totalBucketRevenue ? (b.revenue / totalBucketRevenue) * 100 : 0;
+                  return (
+                    <text x={x + width / 2} y={y - 8} textAnchor="middle" fontSize={10.5} fill="#333333">
+                      {fmtN(b.revenue)} ({pct.toFixed(0)}%)
+                    </text>
+                  );
+                }}
+              />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
