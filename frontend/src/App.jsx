@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import logo from "./assets/logo.jpeg";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, PieChart, Pie, Cell, LabelList, ComposedChart, ReferenceLine } from "recharts";
 import { Send, Check, X, Save, Clock, TrendingUp, TrendingDown, ChevronDown, ChevronRight, ChevronLeft, Search, Loader2, Terminal, RotateCcw, Sparkles, Sliders, Grid3x3, Wand2, RefreshCw, Minus, Maximize2, Minimize2, LayoutDashboard, Building2, Globe, Receipt, Users, Wallet, PieChart as PieChartIcon, BarChart3, History, ClipboardList, AlertTriangle, Target, Lightbulb, MoreVertical, Download, Presentation } from "lucide-react";
 import { exportSheetsAsCsv, exportSheetsAsExcel } from "./exportUtils.js";
@@ -1125,9 +1126,9 @@ function TopBar({ scenario, setScenario, skoUplift, onSave, onSync, syncing, yea
     <header style={styles.topBar}>
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", rowGap: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={styles.logoMark}>CK</div>
+          <img src={logo} alt="CyberKnight" style={styles.logoMark} />
           <div>
-            <div style={styles.brandTitle}>Cyberknight Budget Desk</div>
+            <div style={styles.brandTitle}>Budget Desk</div>
             <div style={{ ...styles.brandSub, fontWeight: 700 }}>Revenue, GP &amp; Performance Intelligence</div>
             <div style={styles.brandSub}>{todayLabel}</div>
           </div>
@@ -6218,7 +6219,7 @@ const styles = {
   appRoot: { fontFamily: "'Inter', sans-serif", background: "#FFFFFF", color: "#111111", height: "100vh", width: "100%", display: "flex", flexDirection: "column", overflow: "hidden" },
   topBar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
   yearRow: { padding: "10px 24px", borderBottom: "1px solid #E0E0E0", background: "#FFFFFF" },
-  logoMark: { width: 34, height: 34, borderRadius: 8, background: "linear-gradient(135deg, #C00000, #7A0000)", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 14, color: "#FFFFFF" },
+  logoMark: { height: 34, width: "auto", display: "block", objectFit: "contain" },
   brandTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 17, lineHeight: 1.1 },
   brandSub: { fontSize: 11.5, color: "#6B6B6B", marginTop: 2 },
   scenarioToggle: { display: "flex", background: "#FFFFFF", borderRadius: 8, padding: 3, border: "1px solid #E0E0E0" },
