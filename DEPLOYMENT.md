@@ -33,7 +33,7 @@ This guide covers everything needed to stand the app up in Cyberknight's own Fir
 
 ### Accounts and access someone needs before starting
 
-- **GitHub**: collaborator access to the private `nallanravindra-zoho/budgeting-tool` repo.
+
 - **Firebase/GCP**: Owner or Editor role on the Google Cloud project this will run in (new or existing project — see the next section).
 - **Microsoft 365 / Entra ID admin**: someone who can register an application in Cyberknight's Azure tenant, for SSO login (IT/security team, typically).
 - **Zoho Analytics**: admin access to the workspace(s) containing the CIPR actuals report, the budget views, the GL/other-expenses ledger, and the Bills view, plus access to Zoho's API Console (api-console.zoho.com) to register an API client.
