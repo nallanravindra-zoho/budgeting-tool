@@ -56,7 +56,7 @@ firestore.rules            — access control (see Step 6)
 functions/                 — the 5 Cloud Functions + Zoho client
 frontend/                  — the React app
 scripts/add-approved-user.js       — one-time: bootstraps the first login
-scripts/seed-baseline-budget.js    — optional: pre-loads a historical baseline budget
+
 ```
 
 ## Step 2 — Create and configure the Firebase project
