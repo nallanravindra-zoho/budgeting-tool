@@ -64,6 +64,8 @@ scripts/
   seed-baseline-budget.js   — One-time baseline budget seeding script
 ```
 
+`DEPLOYMENT.md` (repo root) — the current, up-to-date deployment/handover guide: Firebase project setup, Microsoft SSO configuration, Zoho/Gemini secrets, bootstrapping the first `approvedUsers` entry, ongoing operations, troubleshooting. Rewritten 2026-09-25 for handover to Cyberknight — supersedes its own prior content, which predated Microsoft SSO and the three newer sync functions.
+
 ---
 
 ## 4. The year model (core concept — read this first)
